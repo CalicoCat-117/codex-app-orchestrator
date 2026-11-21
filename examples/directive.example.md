@@ -5,31 +5,33 @@
 - **Worktree / Branch:** `/abs/path/to/worktree` (`<branch>`)
 - **Exclusive Output Directory:** `/abs/path/to/output/<slot>/`
 
-## 1. Strict Workspace & Safety Boundaries
+## 1. Workspace Scope
 
-1. Edit code **only** inside `/abs/path/to/worktree` on branch `<branch>`.
-2. Write reports, manifests, and figures **only** inside `/abs/path/to/output/<slot>/`.
-3. Do **not** edit sibling worktrees, immutable baseline artifacts, or shared boards.
-4. Respect all project data/split/resource invariants (e.g., never touch held-out test sets; respect telemetry spacing >= 10s).
+1. Edit code inside `/abs/path/to/worktree` on branch `<branch>`.
+2. Write reports, manifests, and figures inside `/abs/path/to/output/<slot>/`.
+3. Leave sibling worktrees, baseline artifacts, and shared boards untouched.
+4. Keep project data/split invariants intact and space external telemetry checks by at least 10s.
 
 ## 2. Verified Context (Read First)
 
 - Prior commit / baseline receipt: `/abs/path/to/verified-receipt.json`
 - Key empirical finding motivating this round: `<1–3 concise factual bullets>`
 
-## 3. Required Deliverables
+## 3. Deliverables
 
 1. **Implementation:** `<specific module/script path and behavioral contract>`
-2. **Verification:** `<exact lint / compile / unit test / dry-run gate to pass>`
+2. **Verification:** `<exact lint / compile / unit test / dry-run check>`
 3. **Commit & Handoff Note:** Commit cleanly on `<branch>` and write
    `/abs/path/to/output/<slot>/HANDOFF.md` with:
-   - Exact commit SHA and changed file list
-   - Verification commands run and exact pass/fail results
+   - Commit SHA and changed files
+   - Verification commands run and observed results
    - Integration / cherry-pick notes for Slot 1
 
-## 4. Turn-Yielding Protocol (Mandatory)
+## 4. Turn-Yielding & Turn-End Caption
 
-- Do **not** poll or `sleep()` inside this turn waiting on long-running jobs (> 2 min).
-- Once deliverables are committed and any async jobs/timers are recorded, report
-  exact commit SHAs and artifact paths and **immediately end your turn** so the
-  thread returns to `idle`.
+- Avoid polling or `sleep()` loops inside a turn for jobs longer than ~2 min;
+  once deliverables are committed and any async jobs/timers are recorded, end
+  the turn so the thread returns to `idle`.
+- End the turn with a plain `Caption:` section (3–5 sentences or tight bullets)
+  explaining the core mechanism or design rationale, concrete observed outcomes,
+  and any remaining unknowns—no decorative emojis, hype, or compliance checklists.

@@ -96,6 +96,11 @@ def run_lifecycle_smoke(cli: ctl.CodexAppServerClient, *, timeout_s: float = 90.
             sb = ctx.get("sandbox_policy") or {}
             assert sb.get("type") in ("workspace-write", "workspaceWrite"), f"unexpected sandbox_policy: {ctx}"
 
+            cap1 = cli.thread_caption(tid)
+            cap1_text = ctl.format_session_caption(cap1)
+            assert cap1["caption"], f"expected non-empty caption after turn 1, got {cap1}"
+            assert "Policy:" not in cap1_text, f"default caption should stay free of policy noise: {cap1_text}"
+
             # 3. Dispatch Turn 2 on idle thread -> turn/start
             d2 = cli.dispatch(
                 tid,
@@ -129,6 +134,8 @@ def run_lifecycle_smoke(cli: ctl.CodexAppServerClient, *, timeout_s: float = 90.
                 "lifecycle_ok": True,
                 "temp_thread_id": tid,
                 "turn1_status": st1.get("last_turn_status"),
+                "turn1_caption_source": cap1["caption_source"],
+                "turn1_caption": cap1["caption"],
                 "verified_turn_context": ctx,
                 "turn2_dispatch_mode": d2["mode"],
                 "steer_dispatch_mode": d_steer["mode"],

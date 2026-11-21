@@ -223,7 +223,8 @@ python3 scripts/codex_app_ctl.py create \
   --prompt "Inspect auth.py, propose minimal fix, run tests, and end your turn." \
   --check-quota --pretty
 
-# 4. Inspect status & verify effective rollout turn_context policy
+# 4. Inspect status, render a plain principle-first caption, or verify rollout policy
+python3 scripts/codex_app_ctl.py caption <THREAD_UUID>
 python3 scripts/codex_app_ctl.py status <THREAD_UUID> --verify-policy --last-message --pretty
 
 # 5. Send a directive or live mid-turn steering update (never stalls in queue)
@@ -247,9 +248,10 @@ python3 scripts/codex_app_ctl.py launch-batch \
 | Command | Description | Key Flags |
 | :--- | :--- | :--- |
 | `health` | Query daemon version, socket path, configured defaults, quota (`account/rateLimits/read`), and loaded threads. | `--pretty` |
-| `list` | Search/list persisted or loaded threads. | `--search`, `--cwd`, `--limit`, `--archived`, `--loaded-only` |
+| `list` | Search/list persisted or loaded threads (state-DB-only by default for millisecond lookups). | `--search`, `--cwd`, `--limit`, `--archived`, `--loaded-only`, `--scan-rollouts` |
 | `status` | O(1) live status + latest turn check via `thread/turns/list`. | `--registry`, `--verify-policy`, `--last-message` |
-| `create` | Create a persistent UI-visible thread (`thread/start` + `thread/name/set` + optional Turn-1 `turn/start`). | `--name`, `--cwd`, `--prompt`, `--prompt-file`, `--approval-policy`, `--approvals-reviewer`, `--sandbox`, `--check-quota` |
+| `caption` | Render a readable, unembellished, principle-first caption from a live thread, registry, or offline rollout. | `--registry`, `--path`, `--max-chars`, `--show-policy`, `--json` |
+| `create` | Create a persistent UI-visible thread (`thread/start` + `thread/name/set` + optional Turn-1 `turn/start`). | `--name`, `--cwd`, `--prompt`, `--prompt-file`, `--approval-policy`, `--approvals-reviewer`, `--sandbox`, `--no-caption-guide`, `--check-quota` |
 | `launch-batch` | Validate isolation constraints, launch/reuse a fleet from JSON spec, and emit `FLEET-REGISTRY.json`. | `--spec`, `--registry-out`, `--dry-run`, `--check-quota` |
 | `dispatch` | Smart non-blocking send: `turn/steer` if `inProgress`, `thread/resume` + `turn/start` if `notLoaded`, `turn/start` if `idle`. | `--thread`, `--message`, `--message-file`, `--steer-only`, `--queue-only`, `--check-quota` |
 | `set-policy` | Apply `approvalPolicy`, `approvalsReviewer`, `sandbox`, and optional `model`/`effort` via `thread/resume`. | `--approval-policy`, `--approvals-reviewer`, `--sandbox`, `--model`, `--effort` |

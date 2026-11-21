@@ -125,3 +125,18 @@ limits. Handle this cleanly without losing momentum or corrupting state:
 3. Dispatch the handoff packet to Slot 1 via `codex_app_ctl.py dispatch` and
    verify via `status --verify-policy` that Codex resumed cleanly before
    switching back to periodic supervisor mode.
+
+## 6. Plain, Principle-First Session Captions
+
+Long supervision loops degrade quickly when session outputs turn into either
+raw JSON blobs, emoji-heavy hype cards, or repetitive gatekeeping checklists.
+
+- **Worker turns:** `create` and `launch-batch` attach a brief `Caption:` guide
+  in `developerInstructions` by default (`--no-caption-guide` /
+  `"caption_guide": false` opts out), asking workers to conclude substantive
+  turns with 3–5 plain sentences or tight bullets explaining the underlying
+  mechanism/rationale and concrete observed results.
+- **Supervisor reporting:** Use `codex_app_ctl.py caption --registry FLEET-REGISTRY.json`
+  (or `caption <THREAD_UUID>` / offline `caption --path <rollout.jsonl>`) to
+  extract and present readable captions without noisy policy dumps. Policy
+  details stay hidden unless an actual error occurs or `--show-policy` is passed.

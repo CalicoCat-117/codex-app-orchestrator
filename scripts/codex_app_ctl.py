@@ -15,6 +15,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -32,6 +33,234 @@ CLIENT_INFO = {
 VALID_APPROVAL_POLICIES = ("on-request", "untrusted", "never")
 VALID_REVIEWERS = ("auto_review", "user")
 VALID_SANDBOXES = ("workspace-write", "read-only", "danger-full-access")
+
+DEFAULT_CAPTION_GUIDE = (
+    "End each substantive turn with a short, plain `Caption:` section (3-5 sentences or tight bullets) "
+    "that is easy to read and free of decorative formatting:\n"
+    "- Explain the underlying mechanism, root cause, or design rationale rather than only listing surface status.\n"
+    "- State concrete observed outcomes (files, commits, measurements, or remaining unknowns) in plain language.\n"
+    "- Avoid decorative emojis, hype phrasing, and repetitive compliance or gatekeeping checklists."
+)
+
+_CAPTION_HEADING_RE = re.compile(
+    r"(?im)^[ \t]*(?:"
+    r"#{1,6}[ \t]+(?:\*\*)?caption(?:\*\*)?[ \t]*(?:[:：](?:\*\*)?[ \t]*(.*))?"
+    r"|(?:\*\*)?caption(?:\*\*)?[ \t]*[:：](?:\*\*)?[ \t]*(.*)"
+    r")$"
+)
+_NEXT_HEADING_RE = re.compile(r"(?m)^[ \t]*#{1,6}[ \t]+\S")
+_LEADING_DECORATIVE_EMOJI_RE = re.compile(
+    r"^([ \t]*(?:[-*][ \t]+)?)[✅❌⚠️🚀🔥🎉✨💡📌🟢🔴🟡☑️✔️✖️ℹ️🎯📊📈📉🔧🛠️⚡🌟💥🏆]+[ \t]*"
+)
+
+
+def compose_developer_instructions(
+    developer_instructions: str | None,
+    *,
+    caption_guide: bool = True,
+) -> str | None:
+    """Attach the lightweight plain-caption guide unless explicitly disabled."""
+    base = (developer_instructions or "").strip()
+    if not caption_guide:
+        return base or None
+    if not base:
+        return DEFAULT_CAPTION_GUIDE
+    if "Caption:" in base and "underlying mechanism" in base:
+        return base
+    return f"{base}\n\n{DEFAULT_CAPTION_GUIDE}"
+
+
+def _clean_caption_lines(text: str) -> str:
+    cleaned_lines = []
+    for line in text.splitlines():
+        line = _LEADING_DECORATIVE_EMOJI_RE.sub(r"\1", line).rstrip()
+        cleaned_lines.append(line)
+    joined = "\n".join(cleaned_lines).strip()
+    return re.sub(r"\n{3,}", "\n\n", joined)
+
+
+def _trim_at_boundary(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    window = text[:max_chars]
+    min_keep = max(40, max_chars // 2)
+    for sep in ("\n\n", "\n", "。", ". ", "! ", "? "):
+        idx = window.rfind(sep)
+        if idx >= min_keep:
+            end = idx + (len(sep) if sep in ("。",) else (1 if sep in (". ", "! ", "? ") else 0))
+            trimmed = window[:end].rstrip()
+            suffix = " ..." if trimmed.endswith((".", "。", "!", "?")) else "..."
+            return trimmed + suffix
+    sp = window.rfind(" ")
+    if sp >= min_keep:
+        return window[:sp].rstrip() + "..."
+    return window.rstrip() + "..."
+
+
+def extract_caption_text(raw_text: str | None, *, max_chars: int = 1200) -> tuple[str, str]:
+    """Extract a plain, readable caption from an assistant message.
+
+    Returns `(caption_text, source)` where `source` is `"explicit_caption"`,
+    `"latest_message"`, or `"empty"`.
+    """
+    if not raw_text or not raw_text.strip():
+        return ("", "empty")
+
+    matches = list(_CAPTION_HEADING_RE.finditer(raw_text))
+    if matches:
+        last = matches[-1]
+        inline = (last.group(1) or last.group(2) or "").strip()
+        tail = raw_text[last.end() :]
+        next_hdr = _NEXT_HEADING_RE.search(tail)
+        if next_hdr:
+            tail = tail[: next_hdr.start()]
+        body = f"{inline}\n{tail}".strip() if inline else tail.strip()
+        cleaned = _clean_caption_lines(body)
+        if cleaned:
+            return (_trim_at_boundary(cleaned, max_chars), "explicit_caption")
+
+    cleaned = _clean_caption_lines(raw_text)
+    if not cleaned:
+        return ("", "empty")
+    return (_trim_at_boundary(cleaned, max_chars), "latest_message")
+
+
+def _extract_user_prompt_from_turn(turn: dict[str, Any] | None) -> str | None:
+    """Extract a short preview of the user input from an active turn."""
+    if not isinstance(turn, dict):
+        return None
+    for item in turn.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in ("userMessage", "user"):
+            if isinstance(item.get("text"), str) and item["text"].strip():
+                return item["text"].strip()
+            content = item.get("content")
+            if isinstance(content, list):
+                parts = [
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and isinstance(p.get("text"), str)
+                ]
+                joined = "\n".join(x for x in parts if x).strip()
+                if joined:
+                    return joined
+    return None
+
+
+def _summarize_policy(turn_ctx: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(turn_ctx, dict):
+        return None
+    sb = turn_ctx.get("sandbox_policy")
+    sb_type = sb.get("type") if isinstance(sb, dict) else sb
+    out = {
+        "approval_policy": turn_ctx.get("approval_policy"),
+        "approvals_reviewer": turn_ctx.get("approvals_reviewer"),
+        "sandbox": sb_type,
+    }
+    return out if any(v is not None for v in out.values()) else None
+
+
+def _format_error_summary(last_turn_error: Any, recent_errors: list[dict[str, Any]] | None) -> str | None:
+    if last_turn_error:
+        if isinstance(last_turn_error, dict):
+            return str(last_turn_error.get("message") or last_turn_error.get("code") or last_turn_error)
+        return str(last_turn_error)
+    if recent_errors:
+        latest = recent_errors[-1]
+        msg = latest.get("message") if isinstance(latest, dict) else latest
+        ev_type = latest.get("type") if isinstance(latest, dict) else None
+        if msg:
+            return f"{ev_type}: {msg}" if ev_type else str(msg)
+    return None
+
+
+def format_session_caption(record: dict[str, Any], *, show_policy: bool = False) -> str:
+    """Render a plain, readable, unembellished caption block for one session."""
+    name = (record.get("name") or record.get("id") or "Session").strip()
+    slot = record.get("slot")
+    if slot is not None and not re.match(r"(?i)^slot\s+\d+", name):
+        title = f"Slot {slot} · {name}"
+    else:
+        title = name
+
+    status_type = record.get("status_type") or "unknown"
+    lt_status = record.get("last_turn_status")
+    if status_type == "active" and lt_status == "inProgress":
+        state_str = "active (turn in progress)"
+    elif lt_status:
+        state_str = f"{status_type} (last turn {lt_status})"
+    else:
+        state_str = str(status_type)
+
+    lines = [f"{title} — {state_str}"]
+
+    ctx_parts = []
+    cwd = record.get("cwd")
+    branch = record.get("branch")
+    if cwd:
+        ctx_parts.append(f"Workspace: {cwd} ({branch})" if branch else f"Workspace: {cwd}")
+    elif branch:
+        ctx_parts.append(f"Branch: {branch}")
+
+    model = record.get("model")
+    effort = record.get("effort")
+    if model:
+        ctx_parts.append(f"Model: {model} ({effort})" if effort else f"Model: {model}")
+    if ctx_parts:
+        lines.append(" | ".join(ctx_parts))
+
+    if show_policy:
+        pol = record.get("policy")
+        if isinstance(pol, dict):
+            pol_parts = [str(pol[k]) for k in ("approval_policy", "approvals_reviewer", "sandbox") if pol.get(k)]
+            if pol_parts:
+                lines.append("Policy: " + " / ".join(pol_parts))
+
+    if record.get("error"):
+        lines.append(f"Note: {record['error']}")
+
+    caption_text = (record.get("caption") or "").strip()
+    lines.append("Caption:")
+    if caption_text:
+        for cl in caption_text.splitlines():
+            lines.append(f"  {cl}" if cl.strip() else "")
+    else:
+        lines.append("  No assistant summary recorded yet.")
+
+    return "\n".join(lines)
+
+
+def rollout_caption(
+    path: str | Path,
+    *,
+    name: str | None = None,
+    max_chars: int = 1200,
+) -> dict[str, Any]:
+    """Build a structured caption record directly from a local rollout JSONL file (offline)."""
+    rollout = inspect_rollout_file(path, last_n=3, include_full_last_message=True)
+    if not rollout.get("exists"):
+        raise FileNotFoundError(f"Rollout file not found: {path}")
+    ctx = rollout.get("last_turn_context") or {}
+    caption_text, source = extract_caption_text(rollout.get("last_assistant_text"), max_chars=max_chars)
+    p = Path(path)
+    return {
+        "id": None,
+        "slot": None,
+        "name": name or p.stem,
+        "status_type": "completed" if rollout.get("task_complete_count", 0) > 0 else "recorded",
+        "last_turn_id": ctx.get("turn_id"),
+        "last_turn_status": "completed" if rollout.get("task_complete_count", 0) > 0 else None,
+        "cwd": ctx.get("cwd"),
+        "branch": None,
+        "model": ctx.get("model"),
+        "effort": ctx.get("effort"),
+        "caption": caption_text,
+        "caption_source": source,
+        "error": _format_error_summary(None, rollout.get("recent_errors")),
+        "policy": _summarize_policy(ctx),
+        "path": str(p),
+    }
 
 
 class CodexRPCError(RuntimeError):
@@ -149,7 +378,12 @@ def resolve_socket_path(
     )
 
 
-def inspect_rollout_file(path: str | Path, last_n: int = 5) -> dict[str, Any]:
+def inspect_rollout_file(
+    path: str | Path,
+    last_n: int = 5,
+    *,
+    include_full_last_message: bool = False,
+) -> dict[str, Any]:
     """Read-only local inspection of a Codex rollout JSONL file.
 
     Extracts the latest `turn_context` (ground-truth effective approval policy,
@@ -224,7 +458,7 @@ def inspect_rollout_file(path: str | Path, last_n: int = 5) -> dict[str, Any]:
         for m in assistant_messages[-max(1, last_n) :]
     ]
 
-    return {
+    result: dict[str, Any] = {
         "exists": True,
         "path": str(p),
         "size_bytes": p.stat().st_size,
@@ -234,6 +468,9 @@ def inspect_rollout_file(path: str | Path, last_n: int = 5) -> dict[str, Any]:
         "recent_assistant_messages": trimmed_messages,
         "recent_errors": errors[-max(1, last_n) :],
     }
+    if include_full_last_message:
+        result["last_assistant_text"] = assistant_messages[-1]["text"] if assistant_messages else None
+    return result
 
 
 def _extract_agent_message_from_turn(turn: dict[str, Any] | None) -> str | None:
@@ -608,6 +845,60 @@ class CodexAppServerClient:
                     out["last_agent_message"] = msgs[-1]["preview"]
         return out
 
+    def thread_caption(
+        self,
+        tid: str,
+        *,
+        max_chars: int = 1200,
+        registry_meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build a readable, principle-oriented caption record for a live or persisted thread."""
+        th = self.read_thread(tid, include_turns=False)
+        lt = self.latest_turn(tid)
+        status_obj = th.get("status")
+        status_type = status_obj.get("type") if isinstance(status_obj, dict) else status_obj
+        lt_status = lt.get("status") if isinstance(lt, dict) else None
+        lt_error = lt.get("error") if isinstance(lt, dict) else None
+
+        rollout: dict[str, Any] = {}
+        rpath = th.get("path")
+        if rpath:
+            rollout = inspect_rollout_file(rpath, last_n=3, include_full_last_message=True)
+
+        turn_msg = _extract_agent_message_from_turn(lt)
+        rollout_msg = rollout.get("last_assistant_text") if rollout.get("exists") else None
+        raw_msg = turn_msg or rollout_msg
+        caption_text, source = extract_caption_text(raw_msg, max_chars=max_chars)
+
+        if not caption_text and lt_status == "inProgress":
+            prompt_preview = _extract_user_prompt_from_turn(lt)
+            if prompt_preview:
+                first_line = _trim_at_boundary(_clean_caption_lines(prompt_preview), min(max_chars, 240))
+                caption_text = f"Turn in progress. Active directive: {first_line}"
+            else:
+                caption_text = "Turn in progress (no assistant summary yet)."
+            source = "in_progress"
+
+        meta = registry_meta or {}
+        ctx = rollout.get("last_turn_context") or {}
+        return {
+            "id": th.get("id") or tid,
+            "slot": meta.get("slot"),
+            "name": th.get("name") or meta.get("name"),
+            "status_type": status_type,
+            "last_turn_id": lt.get("id") if isinstance(lt, dict) else ctx.get("turn_id"),
+            "last_turn_status": lt_status,
+            "cwd": th.get("cwd") or meta.get("worktree") or meta.get("cwd") or ctx.get("cwd"),
+            "branch": meta.get("branch"),
+            "model": th.get("model") or ctx.get("model") or meta.get("model"),
+            "effort": th.get("reasoningEffort") or ctx.get("effort") or meta.get("effort"),
+            "caption": caption_text,
+            "caption_source": source,
+            "error": _format_error_summary(lt_error, rollout.get("recent_errors")),
+            "policy": _summarize_policy(ctx),
+            "path": rpath,
+        }
+
     def start_thread(
         self,
         *,
@@ -622,6 +913,7 @@ class CodexAppServerClient:
         writable_roots: list[str] | None = None,
         network_access: bool = False,
         developer_instructions: str | None = None,
+        caption_guide: bool = True,
         ephemeral: bool = False,
     ) -> dict[str, Any]:
         """Create a persistent, Codex App-visible thread and optionally start Turn 1."""
@@ -640,8 +932,12 @@ class CodexAppServerClient:
             cfg["model_reasoning_effort"] = effort
         if cfg:
             start_params["config"] = cfg
-        if developer_instructions:
-            start_params["developerInstructions"] = developer_instructions
+        effective_dev_instructions = compose_developer_instructions(
+            developer_instructions,
+            caption_guide=caption_guide,
+        )
+        if effective_dev_instructions:
+            start_params["developerInstructions"] = effective_dev_instructions
 
         started = self.rpc("thread/start", start_params)
         tid = started["thread"]["id"]
@@ -959,6 +1255,7 @@ def validate_fleet_spec(specs: list[dict[str, Any]], spec_dir: Path) -> list[dic
         item["sandbox"] = sandbox
         item["approval_policy"] = approval_policy
         item["approvals_reviewer"] = reviewer
+        item["caption_guide"] = bool(raw.get("caption_guide", True))
         normalized.append(item)
 
     return normalized
@@ -978,18 +1275,24 @@ def _read_text_arg(message: str | None, message_file: str | None) -> str:
     raise ValueError("One of --message or --message-file is required.")
 
 
-def _load_ids_from_registry(registry_path: str) -> list[str]:
+def _load_registry_entries(registry_path: str) -> list[dict[str, Any]]:
     data = json.loads(Path(registry_path).read_text(encoding="utf-8"))
     sessions = data.get("sessions") if isinstance(data, dict) else data
     if not isinstance(sessions, list):
         raise ValueError(f"Invalid fleet registry format in {registry_path}")
-    ids = []
+    entries = []
     for item in sessions:
         if isinstance(item, dict):
             tid = item.get("id") or item.get("thread_id") or item.get("threadId")
             if tid:
-                ids.append(str(tid))
-    return ids
+                normalized = dict(item)
+                normalized["id"] = str(tid)
+                entries.append(normalized)
+    return entries
+
+
+def _load_ids_from_registry(registry_path: str) -> list[str]:
+    return [entry["id"] for entry in _load_registry_entries(registry_path)]
 
 
 def _print_json(obj: Any, *, pretty: bool = False) -> None:
@@ -1106,6 +1409,11 @@ def build_parser() -> argparse.ArgumentParser:
     s_create.add_argument("--writable-root", action="append", default=[], help="Extra writable root (repeatable).")
     s_create.add_argument("--network-access", action="store_true", help="Allow network access inside sandbox.")
     s_create.add_argument("--developer-instructions", default=None, help="Optional thread-level developer instructions.")
+    s_create.add_argument(
+        "--no-caption-guide",
+        action="store_true",
+        help="Do not attach the default plain principle-first turn caption instruction.",
+    )
     s_create.add_argument("--ephemeral", action="store_true", help="Create an ephemeral thread (not persisted).")
     s_create.add_argument("--check-quota", action="store_true", help="Abort before creation if Codex quota is exhausted.")
 
@@ -1183,6 +1491,23 @@ def build_parser() -> argparse.ArgumentParser:
     s_roll.add_argument("--path", default=None, help="Direct local path to rollout JSONL (no daemon needed).")
     s_roll.add_argument("--last-n", type=int, default=5, help="Number of recent assistant messages/errors to return.")
 
+    # caption
+    s_cap = sub.add_parser(
+        "caption",
+        parents=[sub_common],
+        help="Render a readable, principle-first plain caption for one or more sessions (or offline rollout).",
+    )
+    s_cap.add_argument("ids", nargs="*", help="Thread UUID(s).")
+    s_cap.add_argument("--registry", default=None, help="Load session slots from a FLEET-REGISTRY.json file.")
+    s_cap.add_argument("--path", default=None, help="Direct local path to rollout JSONL (no daemon needed).")
+    s_cap.add_argument("--max-chars", type=int, default=1200, help="Maximum caption length in characters (default: 1200).")
+    s_cap.add_argument(
+        "--show-policy",
+        action="store_true",
+        help="Include a compact one-line runtime policy summary (omitted by default to avoid noise).",
+    )
+    s_cap.add_argument("--json", action="store_true", help="Emit structured JSON instead of plain text.")
+
     return p
 
 
@@ -1193,6 +1518,19 @@ def main(argv: list[str] | None = None) -> int:
     # Offline path for inspect-rollout --path (no daemon required).
     if args.cmd == "inspect-rollout" and args.path and not args.thread:
         _print_json(inspect_rollout_file(args.path, last_n=args.last_n), pretty=args.pretty)
+        return 0
+
+    # Offline path for caption --path (no daemon required).
+    if args.cmd == "caption" and args.path and not args.ids and not args.registry:
+        try:
+            rec = rollout_caption(args.path, max_chars=args.max_chars)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            _print_json({"ok": False, "error": type(exc).__name__, "detail": str(exc)}, pretty=args.pretty)
+            return 1
+        if args.json:
+            _print_json(rec, pretty=args.pretty)
+        else:
+            print(format_session_caption(rec, show_policy=args.show_policy), flush=True)
         return 0
 
     if args.cmd == "launch-batch" and args.dry_run:
@@ -1213,6 +1551,7 @@ def main(argv: list[str] | None = None) -> int:
                 "approval_policy": item["approval_policy"],
                 "approvals_reviewer": item["approvals_reviewer"],
                 "sandbox": item["sandbox"],
+                "caption_guide": item["caption_guide"],
                 "has_prompt": item["resolved_prompt"] is not None,
             }
             for i, item in enumerate(validated)
@@ -1268,6 +1607,7 @@ def main(argv: list[str] | None = None) -> int:
                     writable_roots=args.writable_root,
                     network_access=args.network_access,
                     developer_instructions=args.developer_instructions,
+                    caption_guide=not args.no_caption_guide,
                     ephemeral=args.ephemeral,
                 )
                 _print_json(res, pretty=args.pretty)
@@ -1328,6 +1668,7 @@ def main(argv: list[str] | None = None) -> int:
                             writable_roots=item.get("writable_roots"),
                             network_access=bool(item.get("network_access", False)),
                             developer_instructions=item.get("developer_instructions"),
+                            caption_guide=bool(item.get("caption_guide", True)),
                             ephemeral=bool(item.get("ephemeral", False)),
                         )
                         entry = {
@@ -1421,6 +1762,24 @@ def main(argv: list[str] | None = None) -> int:
                 if not rpath:
                     raise FileNotFoundError(f"Thread {args.thread} has no rollout path reported.")
                 _print_json(inspect_rollout_file(rpath, last_n=args.last_n), pretty=args.pretty)
+
+            elif args.cmd == "caption":
+                targets: list[tuple[str, dict[str, Any] | None]] = [(tid, None) for tid in args.ids]
+                if args.registry:
+                    for entry in _load_registry_entries(args.registry):
+                        targets.append((entry["id"], entry))
+                if not targets:
+                    parser.error("caption requires at least one thread ID, --registry, or --path.")
+                records = [
+                    cli.thread_caption(tid, max_chars=args.max_chars, registry_meta=meta)
+                    for tid, meta in targets
+                ]
+                if args.json:
+                    payload: Any = records[0] if len(records) == 1 else {"count": len(records), "captions": records}
+                    _print_json(payload, pretty=args.pretty)
+                else:
+                    blocks = [format_session_caption(r, show_policy=args.show_policy) for r in records]
+                    print("\n\n".join(blocks), flush=True)
 
     except QuotaExhaustedError as exc:
         _print_json(

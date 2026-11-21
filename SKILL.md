@@ -61,6 +61,18 @@ installation is required.
    - Audit local receipts, git commits, and manifests before querying remote
      clusters or APIs; space any external/shared-server telemetry queries by
      at least 10 seconds (prefer 15–60s+ or milestone-aligned wakeups).
+6. **Return plain, principle-first session captions.**
+   - Keep session updates and handoffs easy to read and understated: explain the
+     underlying mechanism, root cause, or design rationale (*why* a change works
+     or failed) alongside concrete observed outcomes (files, commits, metrics,
+     or open unknowns).
+   - Avoid decorative emojis, hype phrasing, and repetitive gatekeeping or
+     compliance checklists—only surface policy, sandbox, or error notes when a
+     real deviation or blocker occurs (or when explicitly requested).
+   - `create` and `launch-batch` attach this lightweight caption guide to
+     `developerInstructions` by default (disable with `--no-caption-guide` or
+     `"caption_guide": false`), and `caption` extracts and formats clean plain
+     captions from live sessions or rollouts.
 
 ## Standard Workflow
 
@@ -105,15 +117,20 @@ python3 scripts/codex_app_ctl.py launch-batch \
 `launch-batch` rejects duplicate `worktree` or `output_dir` assignments across
 writer slots before making any RPC calls.
 
-### 3. Monitor, Verify Policy, and Steer/Dispatch
+### 3. Monitor, Render Captions, Verify Policy, and Steer/Dispatch
 
 Inspect the whole fleet in one lightweight O(1) pass (uses `thread/turns/list`
-with `limit=1`, avoiding full-history downloads):
+with `limit=1`, avoiding full-history downloads), or render a readable,
+unembellished caption directly:
 
 ```bash
 python3 scripts/codex_app_ctl.py status \
   --registry /abs/path/to/FLEET-REGISTRY.json \
   --verify-policy --last-message --pretty
+
+# Plain, principle-first session caption (supports thread IDs, --registry, or offline --path)
+python3 scripts/codex_app_ctl.py caption --registry /abs/path/to/FLEET-REGISTRY.json
+python3 scripts/codex_app_ctl.py caption <THREAD_UUID> --json --pretty
 ```
 
 Deliver a new round directive or mid-turn correction without blocking:

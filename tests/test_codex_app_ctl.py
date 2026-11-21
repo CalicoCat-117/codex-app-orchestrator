@@ -710,6 +710,171 @@ class TestCodexAppCtl(unittest.TestCase):
         self.assertEqual(proc_dry.returncode, 0, proc_dry.stderr)
         self.assertIn('\n  "dry_run": true', proc_dry.stdout)
 
+    def test_caption_guide_composition_and_opt_out(self) -> None:
+        with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
+            cli.start_thread(name="Default Caption Guide", cwd=str(self.tmp_path))
+            cli.start_thread(
+                name="Composed Guide",
+                cwd=str(self.tmp_path),
+                developer_instructions="Focus on numerical stability.",
+            )
+            cli.start_thread(
+                name="Opt-Out Guide",
+                cwd=str(self.tmp_path),
+                caption_guide=False,
+            )
+
+        start_calls = [p for m, p in self.server.calls if m == "thread/start"]
+        self.assertIn("Caption:", start_calls[0]["developerInstructions"])
+        self.assertIn("Focus on numerical stability.", start_calls[1]["developerInstructions"])
+        self.assertIn("Caption:", start_calls[1]["developerInstructions"])
+        self.assertNotIn("developerInstructions", start_calls[2])
+
+        # CLI `--no-caption-guide` flag disables injection
+        proc = self._run_cli("create", "--name", "CLI Opt-Out", "--cwd", str(self.tmp_path), "--no-caption-guide")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        last_start = [p for m, p in self.server.calls if m == "thread/start"][-1]
+        self.assertNotIn("developerInstructions", last_start)
+
+    def test_caption_extraction_and_cli_rendering(self) -> None:
+        # 1. Explicit Caption section extraction + emoji cleanup + stop at next heading
+        raw = (
+            "Detailed build log...\n\n"
+            "## Caption\n"
+            "- ✅ Querying the state DB avoids scanning hundreds of rollout JSONLs.\n"
+            "- Latency dropped from >60s timeout to 12ms across 500 sessions.\n\n"
+            "## Appendix\n"
+            "Unrelated raw dump."
+        )
+        cap, src = ctl.extract_caption_text(raw)
+        self.assertEqual(src, "explicit_caption")
+        self.assertNotIn("✅", cap)
+        self.assertNotIn("Appendix", cap)
+        self.assertIn("Querying the state DB", cap)
+        self.assertIn("12ms", cap)
+
+        # Inline bold / CJK colon form
+        cap_inline, src_inline = ctl.extract_caption_text("前置分析...\n\n**Caption：** 采用增量状态库查询以消除全盘扫描阻塞。")
+        self.assertEqual(src_inline, "explicit_caption")
+        self.assertEqual(cap_inline, "采用增量状态库查询以消除全盘扫描阻塞。")
+
+        # Fallback when no explicit Caption section exists, with boundary trim
+        cap_fb, src_fb = ctl.extract_caption_text("First sentence explains mechanism. Second sentence adds detail.", max_chars=45)
+        self.assertEqual(src_fb, "latest_message")
+        self.assertTrue(cap_fb.endswith("..."))
+        self.assertIn("First sentence explains mechanism.", cap_fb)
+
+        # 2. Offline rollout caption CLI (plain text omits noisy policy unless `--show-policy`)
+        rollout_path = self.tmp_path / "rollout-caption.jsonl"
+        entries = [
+            {
+                "timestamp": "2026-11-21T00:00:01Z",
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": "turn-0009",
+                    "model": "gpt-test-model",
+                    "effort": "max",
+                    "approval_policy": "on-request",
+                    "approvals_reviewer": "auto_review",
+                    "sandbox_policy": {"type": "workspace-write"},
+                    "cwd": str(self.tmp_path),
+                },
+            },
+            {
+                "timestamp": "2026-11-21T00:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": (
+                                "Long trace omitted.\n\n"
+                                "Caption:\n"
+                                "Replaced blocking JSONL scans with state-DB queries because filtered "
+                                "thread/list calls previously re-read every historical rollout on disk. "
+                                "All 12 unit tests pass."
+                            ),
+                        }
+                    ],
+                },
+            },
+            {
+                "timestamp": "2026-11-21T00:00:03Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete"},
+            },
+        ]
+        rollout_path.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
+
+        proc_plain = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "codex_app_ctl.py"), "caption", "--path", str(rollout_path)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(proc_plain.returncode, 0, proc_plain.stderr)
+        self.assertIn("Caption:", proc_plain.stdout)
+        self.assertIn("Replaced blocking JSONL scans", proc_plain.stdout)
+        self.assertNotIn("Policy:", proc_plain.stdout)
+
+        proc_pol = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS_DIR / "codex_app_ctl.py"),
+                "caption",
+                "--path",
+                str(rollout_path),
+                "--show-policy",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(proc_pol.returncode, 0, proc_pol.stderr)
+        self.assertIn("Policy: on-request / auto_review / workspace-write", proc_pol.stdout)
+
+        # 3. Live mock-server `caption --registry` + `--json --pretty` + active turn
+        with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
+            th1 = cli.start_thread(name="Search Fix", cwd=str(self.tmp_path), prompt="Fix search latency")
+            tid1 = th1["id"]
+            self.server.threads[tid1]["path"] = str(rollout_path)
+            self.server.threads[tid1]["status"] = {"type": "idle"}
+            self.server.turns[tid1][-1]["status"] = "completed"
+
+            th2 = cli.start_thread(name="Active Worker", cwd=str(self.tmp_path), prompt="Measure memory overhead")
+            tid2 = th2["id"]
+
+        reg_path = self.tmp_path / "FLEET-REGISTRY.json"
+        reg_path.write_text(
+            json.dumps(
+                {
+                    "sessions": [
+                        {"slot": 1, "id": tid1, "name": "Search Fix", "branch": "exp/fast-list"},
+                        {"slot": 2, "id": tid2, "name": "Active Worker", "branch": "exp/mem"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        proc_reg = self._run_cli("caption", "--registry", str(reg_path))
+        self.assertEqual(proc_reg.returncode, 0, proc_reg.stderr)
+        self.assertIn("Slot 1 · Search Fix — idle (last turn completed)", proc_reg.stdout)
+        self.assertIn("(exp/fast-list)", proc_reg.stdout)
+        self.assertIn("Replaced blocking JSONL scans", proc_reg.stdout)
+        self.assertIn("Slot 2 · Active Worker — active (turn in progress)", proc_reg.stdout)
+        self.assertIn("Measure memory overhead", proc_reg.stdout)
+
+        proc_json = self._run_cli("caption", tid1, "--json", "--pretty")
+        self.assertEqual(proc_json.returncode, 0, proc_json.stderr)
+        parsed = json.loads(proc_json.stdout)
+        self.assertEqual(parsed["caption_source"], "explicit_caption")
+        self.assertIn("Replaced blocking JSONL scans", parsed["caption"])
+
     def test_archive_unarchive_and_delete(self) -> None:
         with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
             created = cli.start_thread(name="Ephemeral Cleanup", cwd=str(self.tmp_path))
