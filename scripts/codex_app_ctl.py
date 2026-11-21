@@ -506,6 +506,7 @@ class CodexAppServerClient:
         limit: int = 25,
         archived: bool | None = None,
         loaded_only: bool = False,
+        use_state_db_only: bool = True,
     ) -> list[dict[str, Any]]:
         loaded_set = set(self.list_loaded_threads())
         params: dict[str, Any] = {"limit": limit}
@@ -515,7 +516,16 @@ class CodexAppServerClient:
             params["cwd"] = cwd
         if archived is not None:
             params["archived"] = archived
-        res = self.rpc("thread/list", params)
+        if use_state_db_only:
+            params["useStateDbOnly"] = True
+        try:
+            res = self.rpc("thread/list", params)
+        except CodexRPCError:
+            if not use_state_db_only:
+                raise
+            # Compatibility fallback for older app-server builds without `useStateDbOnly`.
+            params.pop("useStateDbOnly", None)
+            res = self.rpc("thread/list", params)
         rows = res.get("data") or []
         out = []
         for th in rows:
@@ -1008,23 +1018,63 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--pretty",
         action="store_true",
+        default=False,
         help="Pretty-print JSON output.",
     )
+
+    # Allow global transport/formatting flags both before and after the subcommand
+    # without letting subparser defaults clobber values parsed at top level.
+    sub_common = argparse.ArgumentParser(add_help=False)
+    sub_common.add_argument(
+        "--socket",
+        default=argparse.SUPPRESS,
+        help="Explicit Unix socket path (default: auto-discover via `codex app-server daemon version`).",
+    )
+    sub_common.add_argument(
+        "--timeout",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Socket timeout in seconds (default: 20).",
+    )
+    sub_common.add_argument(
+        "--pretty",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Pretty-print JSON output.",
+    )
+
     sub = p.add_subparsers(dest="cmd", required=True)
 
     # health
-    sub.add_parser("health", help="Check daemon connectivity, defaults, quota health, and loaded threads.")
+    sub.add_parser(
+        "health",
+        parents=[sub_common],
+        help="Check daemon connectivity, defaults, quota health, and loaded threads.",
+    )
 
     # list
-    s_list = sub.add_parser("list", help="List Codex sessions visible in the app-server.")
+    s_list = sub.add_parser(
+        "list",
+        parents=[sub_common],
+        help="List Codex sessions visible in the app-server.",
+    )
     s_list.add_argument("--search", default=None, help="Filter threads by search term.")
     s_list.add_argument("--cwd", default=None, help="Filter threads by working directory.")
     s_list.add_argument("--limit", type=int, default=25, help="Maximum number of threads to return.")
     s_list.add_argument("--archived", action="store_true", default=None, help="Include archived threads.")
     s_list.add_argument("--loaded-only", action="store_true", help="Only show currently loaded threads.")
+    s_list.add_argument(
+        "--scan-rollouts",
+        action="store_true",
+        help="Scan JSONL rollouts on disk instead of state-DB-only listing (slower on large histories).",
+    )
 
     # status
-    s_status = sub.add_parser("status", help="Inspect live status and latest turn of one or more threads.")
+    s_status = sub.add_parser(
+        "status",
+        parents=[sub_common],
+        help="Inspect live status and latest turn of one or more threads.",
+    )
     s_status.add_argument("ids", nargs="*", help="Thread UUID(s).")
     s_status.add_argument("--registry", default=None, help="Load thread IDs from a FLEET-REGISTRY.json file.")
     s_status.add_argument(
@@ -1039,7 +1089,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # create
-    s_create = sub.add_parser("create", help="Create a persistent UI-visible Codex session.")
+    s_create = sub.add_parser(
+        "create",
+        parents=[sub_common],
+        help="Create a persistent UI-visible Codex session.",
+    )
     s_create.add_argument("--name", required=True, help="Human-readable session name shown in the Codex UI.")
     s_create.add_argument("--cwd", default=os.getcwd(), help="Working directory for the session.")
     s_create.add_argument("--prompt", default=None, help="Initial Turn-1 prompt text (or '-' for stdin).")
@@ -1056,7 +1110,11 @@ def build_parser() -> argparse.ArgumentParser:
     s_create.add_argument("--check-quota", action="store_true", help="Abort before creation if Codex quota is exhausted.")
 
     # launch-batch
-    s_batch = sub.add_parser("launch-batch", help="Validate and launch a multi-session fleet from a JSON spec.")
+    s_batch = sub.add_parser(
+        "launch-batch",
+        parents=[sub_common],
+        help="Validate and launch a multi-session fleet from a JSON spec.",
+    )
     s_batch.add_argument("--spec", required=True, help="Path to fleet spec JSON file.")
     s_batch.add_argument("--registry-out", default=None, help="Path to write FLEET-REGISTRY.json.")
     s_batch.add_argument("--dry-run", action="store_true", help="Validate spec and print plan without RPC writes.")
@@ -1065,6 +1123,7 @@ def build_parser() -> argparse.ArgumentParser:
     # dispatch
     s_disp = sub.add_parser(
         "dispatch",
+        parents=[sub_common],
         help="Smart non-blocking dispatch (`turn/steer` if active, `thread/resume` + `turn/start` if unloaded, `turn/start` if idle).",
     )
     s_disp.add_argument("--thread", required=True, help="Target thread UUID.")
@@ -1083,7 +1142,11 @@ def build_parser() -> argparse.ArgumentParser:
     s_disp.add_argument("--check-quota", action="store_true", help="Abort if Codex quota is exhausted.")
 
     # set-policy
-    s_pol = sub.add_parser("set-policy", help="Apply approval/sandbox/model policy to existing threads.")
+    s_pol = sub.add_parser(
+        "set-policy",
+        parents=[sub_common],
+        help="Apply approval/sandbox/model policy to existing threads.",
+    )
     s_pol.add_argument("ids", nargs="+", help="Thread UUID(s).")
     s_pol.add_argument("--model", default=None)
     s_pol.add_argument("--effort", default=None)
@@ -1092,22 +1155,30 @@ def build_parser() -> argparse.ArgumentParser:
     s_pol.add_argument("--sandbox", default="workspace-write", choices=VALID_SANDBOXES)
 
     # interrupt
-    s_int = sub.add_parser("interrupt", help="Interrupt an active turn on a thread.")
+    s_int = sub.add_parser(
+        "interrupt",
+        parents=[sub_common],
+        help="Interrupt an active turn on a thread.",
+    )
     s_int.add_argument("--thread", required=True, help="Thread UUID.")
     s_int.add_argument("--turn", default=None, help="Explicit turn UUID (default: auto-detect active turn).")
 
     # archive / unarchive / delete
-    s_arch = sub.add_parser("archive", help="Archive one or more threads.")
+    s_arch = sub.add_parser("archive", parents=[sub_common], help="Archive one or more threads.")
     s_arch.add_argument("ids", nargs="+")
 
-    s_unarch = sub.add_parser("unarchive", help="Unarchive one or more threads.")
+    s_unarch = sub.add_parser("unarchive", parents=[sub_common], help="Unarchive one or more threads.")
     s_unarch.add_argument("ids", nargs="+")
 
-    s_del = sub.add_parser("delete", help="Permanently delete one or more threads.")
+    s_del = sub.add_parser("delete", parents=[sub_common], help="Permanently delete one or more threads.")
     s_del.add_argument("ids", nargs="+")
 
     # inspect-rollout
-    s_roll = sub.add_parser("inspect-rollout", help="Inspect a thread's rollout JSONL for ground-truth turn_context & errors.")
+    s_roll = sub.add_parser(
+        "inspect-rollout",
+        parents=[sub_common],
+        help="Inspect a thread's rollout JSONL for ground-truth turn_context & errors.",
+    )
     s_roll.add_argument("--thread", default=None, help="Thread UUID (resolves rollout path via app-server).")
     s_roll.add_argument("--path", default=None, help="Direct local path to rollout JSONL (no daemon needed).")
     s_roll.add_argument("--last-n", type=int, default=5, help="Number of recent assistant messages/errors to return.")
@@ -1161,6 +1232,7 @@ def main(argv: list[str] | None = None) -> int:
                     limit=args.limit,
                     archived=args.archived,
                     loaded_only=args.loaded_only,
+                    use_state_db_only=not args.scan_rollouts,
                 )
                 _print_json({"count": len(rows), "threads": rows}, pretty=args.pretty)
 

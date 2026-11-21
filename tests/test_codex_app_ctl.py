@@ -68,6 +68,7 @@ class MockCodexAppServer:
         self.send_unsolicited_notification = True
         self.fail_steer_race_once = False
         self.disable_turns_list = False
+        self.reject_state_db_only = False
         self.received_pongs: list[bytes] = []
 
     def start(self) -> None:
@@ -223,6 +224,8 @@ class MockCodexAppServer:
         if method == "thread/loaded/list":
             return {"data": sorted(self.loaded), "nextCursor": None}
         if method == "thread/list":
+            if self.reject_state_db_only and "useStateDbOnly" in params:
+                raise ValueError("unknown field `useStateDbOnly`")
             rows = list(self.threads.values())
             if params.get("searchTerm"):
                 needle = params["searchTerm"].lower()
@@ -481,6 +484,28 @@ class TestCodexAppCtl(unittest.TestCase):
             self.assertEqual(st["last_turn_id"], created["turn_id"])
             self.assertEqual(st["last_turn_status"], "inProgress")
 
+    def test_list_threads_uses_state_db_only_and_falls_back(self) -> None:
+        with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
+            cli.start_thread(name="Fast List Check", cwd=str(self.tmp_path))
+            rows = cli.list_threads(search="Fast List", limit=5)
+            self.assertEqual(len(rows), 1)
+
+        list_calls = [p for m, p in self.server.calls if m == "thread/list"]
+        self.assertTrue(list_calls[-1].get("useStateDbOnly"))
+
+        # Older server rejecting `useStateDbOnly` should fall back transparently
+        self.server.reject_state_db_only = True
+        with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
+            rows_legacy = cli.list_threads(search="Fast List", limit=5)
+            self.assertEqual(len(rows_legacy), 1)
+        self.server.reject_state_db_only = False
+
+        # `--scan-rollouts` explicitly disables `useStateDbOnly`
+        proc_scan = self._run_cli("list", "--search", "Fast List", "--scan-rollouts", "--pretty")
+        self.assertEqual(proc_scan.returncode, 0, proc_scan.stderr)
+        list_calls_after = [p for m, p in self.server.calls if m == "thread/list"]
+        self.assertNotIn("useStateDbOnly", list_calls_after[-1])
+
     def test_loaded_thread_set_policy_note_and_turn_override(self) -> None:
         with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
             created = cli.start_thread(
@@ -614,6 +639,76 @@ class TestCodexAppCtl(unittest.TestCase):
         self.assertEqual(proc_st.returncode, 0, proc_st.stderr)
         lines = [json.loads(line) for line in proc_st.stdout.strip().splitlines()]
         self.assertEqual(len(lines), 2)
+
+    def test_global_flags_before_after_and_mixed_with_subcommands(self) -> None:
+        # 1. Trailing global flags after subcommand (matches SKILL.md / README.md examples)
+        proc_after = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS_DIR / "codex_app_ctl.py"),
+                "health",
+                "--socket",
+                str(self.sock_path),
+                "--timeout",
+                "12",
+                "--pretty",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(proc_after.returncode, 0, proc_after.stderr)
+        self.assertIn('\n  "socketPath":', proc_after.stdout)
+        self.assertEqual(json.loads(proc_after.stdout)["defaults"]["model"], "gpt-test-model")
+
+        # 2. Leading global flags before subcommand must not be clobbered by subparser defaults
+        proc_before = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS_DIR / "codex_app_ctl.py"),
+                "--pretty",
+                "--timeout",
+                "12",
+                "--socket",
+                str(self.sock_path),
+                "health",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(proc_before.returncode, 0, proc_before.stderr)
+        self.assertIn('\n  "socketPath":', proc_before.stdout)
+
+        # 3. Mixed leading + trailing global flags across offline and RPC commands
+        parser = ctl.build_parser()
+        ns = parser.parse_args(["--timeout", "7.5", "list", "--limit", "3", "--pretty", "--socket", "/tmp/demo.sock"])
+        self.assertEqual(ns.cmd, "list")
+        self.assertEqual(ns.timeout, 7.5)
+        self.assertEqual(ns.limit, 3)
+        self.assertTrue(ns.pretty)
+        self.assertEqual(ns.socket, "/tmp/demo.sock")
+
+        example_spec = REPO_ROOT / "examples" / "fleet-spec.example.json"
+        proc_dry = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS_DIR / "codex_app_ctl.py"),
+                "launch-batch",
+                "--spec",
+                str(example_spec),
+                "--dry-run",
+                "--pretty",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(proc_dry.returncode, 0, proc_dry.stderr)
+        self.assertIn('\n  "dry_run": true', proc_dry.stdout)
 
     def test_archive_unarchive_and_delete(self) -> None:
         with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
