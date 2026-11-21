@@ -1,0 +1,60 @@
+[
+  {
+    "slot": 1,
+    "name": "Slot 1 · Primary Integration & Ops",
+    "role": "Owns integration branch, merges verified sibling branches, manages remote job launches and shared state.",
+    "existing_thread_id": null,
+    "cwd": "/abs/path/to/workspace",
+    "worktree": "/abs/path/to/workspace/repo-main",
+    "branch": "exp/main-integration",
+    "output_dir": "/abs/path/to/workspace/output/slot1-ops",
+    "approval_policy": "on-request",
+    "approvals_reviewer": "auto_review",
+    "sandbox": "workspace-write",
+    "cluster_write_owner": true,
+    "prompt": "You are Slot 1 (Primary Integration & Ops) in a supervised Codex fleet. Work inside /abs/path/to/workspace/repo-main (branch exp/main-integration) and write logs/manifests to /abs/path/to/workspace/output/slot1-ops. Follow the Turn-Yielding Protocol: after launching any long-running job (>2 min), record job IDs and artifacts and immediately end your turn."
+  },
+  {
+    "slot": 2,
+    "name": "Slot 2 · Feature Track A",
+    "role": "Implements Track A module + unit tests in an isolated git worktree (zero shared-state or cluster writes).",
+    "cwd": "/abs/path/to/workspace",
+    "worktree": "/abs/path/to/workspace/repo-track-a",
+    "branch": "exp/track-a",
+    "output_dir": "/abs/path/to/workspace/output/slot2-track-a",
+    "approval_policy": "on-request",
+    "approvals_reviewer": "auto_review",
+    "sandbox": "workspace-write",
+    "cluster_write_owner": false,
+    "prompt": "You are Slot 2 (Feature Track A). Work ONLY inside /abs/path/to/workspace/repo-track-a (branch exp/track-a) and write design notes ONLY to /abs/path/to/workspace/output/slot2-track-a. Never touch sibling worktrees, shared boards, or cluster launches. Commit cleanly and end your turn immediately upon completion."
+  },
+  {
+    "slot": 3,
+    "name": "Slot 3 · Feature Track B",
+    "role": "Implements Track B module + unit tests in an isolated git worktree (zero shared-state or cluster writes).",
+    "cwd": "/abs/path/to/workspace",
+    "worktree": "/abs/path/to/workspace/repo-track-b",
+    "branch": "exp/track-b",
+    "output_dir": "/abs/path/to/workspace/output/slot3-track-b",
+    "approval_policy": "on-request",
+    "approvals_reviewer": "auto_review",
+    "sandbox": "workspace-write",
+    "cluster_write_owner": false,
+    "prompt": "You are Slot 3 (Feature Track B). Work ONLY inside /abs/path/to/workspace/repo-track-b (branch exp/track-b) and write design notes ONLY to /abs/path/to/workspace/output/slot3-track-b. Never touch sibling worktrees, shared boards, or cluster launches. Commit cleanly and end your turn immediately upon completion."
+  },
+  {
+    "slot": 4,
+    "name": "Slot 4 · Read-Only Error Analysis & Audit",
+    "role": "Mines verified local receipts, diagnoses failure modes, and writes structured diagnostic reports without editing git repos.",
+    "cwd": "/abs/path/to/workspace",
+    "worktree": null,
+    "branch": null,
+    "output_dir": "/abs/path/to/workspace/output/slot4-diagnostics",
+    "approval_policy": "on-request",
+    "approvals_reviewer": "auto_review",
+    "sandbox": "workspace-write",
+    "read_only": true,
+    "cluster_write_owner": false,
+    "prompt": "You are Slot 4 (Read-Only Analyst). Do NOT modify any git repository. Read only verified local artifacts and write your diagnostic report and summary JSON strictly inside /abs/path/to/workspace/output/slot4-diagnostics. End your turn immediately when deliverables are saved."
+  }
+]
