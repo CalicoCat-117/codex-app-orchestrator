@@ -260,10 +260,10 @@ python3 scripts/codex_app_ctl.py launch-batch \
 | `set-policy` | Apply `approvalPolicy`, `approvalsReviewer`, `sandbox`, and optional `model`/`effort` via `thread/resume`. | `--approval-policy`, `--approvals-reviewer`, `--sandbox`, `--model`, `--effort` |
 | `interrupt` | Gracefully stop an active turn via `turn/interrupt` (auto-detects active turn ID). | `--thread`, `--turn` |
 | `inspect-rollout` | Read-only inspection of rollout JSONL (plain or `zstd`-compressed `.jsonl.zst`) for ground-truth `turn_context`, recent messages, and errors. | `--thread` or `--path` (100% offline), `--last-n` |
-| `retire` | Archive sessions with no follow-up; skips running turns, pending questions or decisions, and failed/interrupted last turns, with a reason per skip. | `<THREAD_UUID>...`, `--registry`, `--dry-run`, `--force` |
+| `retire` | Archive sessions with no follow-up; skips running turns, pending questions or decisions, and failed/interrupted last turns, with a reason per skip. A thread another Codex process holds open is skipped as `held_by_other_process`; any other per-thread failure is reported as `action: "error"` and the batch continues (exit `1`). | `<THREAD_UUID>...`, `--registry`, `--dry-run`, `--force` |
 | `archive` / `unarchive` / `delete` | Unchecked thread lifecycle cleanup (`delete` for throwaway smoke tests). | `<THREAD_UUID>...` |
 
-**Exit Codes:** `0` = success · `1` = RPC, socket, or validation error · `3` = quota exhausted (`ordinaryUsageAllowed == false`).
+**Exit Codes:** `0` = success · `1` = RPC, socket, or validation error (for `retire`: at least one thread errored) · `3` = quota exhausted (`ordinaryUsageAllowed == false`).
 
 ---
 

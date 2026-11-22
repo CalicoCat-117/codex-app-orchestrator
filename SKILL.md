@@ -113,6 +113,14 @@ installation is required.
      last turn, and reports each skip with a reason. `--force` covers the last
      two after you have handled them; a running turn is never archived
      (`interrupt` it first).
+   - A thread that another Codex process holds open (an open Codex TUI, or the
+     `codex app-server` child of the Claude Code Codex plugin's
+     `app-server-broker.mjs`) cannot be archived. `retire` reports it as
+     `skipped` with reason `held_by_other_process` and moves on; retire it
+     again once that process lets go of it. `--dry-run` cannot detect this.
+   - `retire` handles each thread on its own. Any other failure is reported as
+     `action: "error"` for that thread, the rest of the batch still runs, and
+     the command exits `1` if any thread failed.
    - Archiving is reversible. `dispatch` to an archived thread unarchives it
      before resuming, so a later follow-up still works.
    - Use `delete` only for throwaway smoke-test threads.
@@ -227,10 +235,11 @@ python3 scripts/codex_app_ctl.py archive <THREAD_UUID>
 python3 scripts/codex_app_ctl.py delete <TEMP_THREAD_UUID>
 ```
 
-Each `retire` line reports `action` (`archived`, `would_archive`, or `skipped`
-with a `reason` such as `turn_in_progress`, `needs_attention:decision_needed`,
-`last_turn_failed`, or `already_archived`). `status` shows `archived` per
-thread.
+Each `retire` line reports `action`: `archived`, `would_archive`, `skipped`
+with a `reason` (such as `turn_in_progress`, `needs_attention:decision_needed`,
+`last_turn_failed`, `already_archived`, or `held_by_other_process`), or `error`
+with the failure `detail`. `retire` exits `1` when any thread errored.
+`status` shows `archived` per thread.
 
 ### 5. Periodic Supervision Loop
 

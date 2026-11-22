@@ -74,6 +74,8 @@ class MockCodexAppServer:
         self.disable_turns_list = False
         self.reject_state_db_only = False
         self.thread_list_page_max = 100
+        self.archive_held: set[str] = set()  # held open by another codex process
+        self.archive_errors: dict[str, str] = {}
         self.received_pongs: list[bytes] = []
 
     def start(self) -> None:
@@ -373,6 +375,10 @@ class MockCodexAppServer:
             # archived_sessions/; archiving again fails because the live rollout is gone.
             tid = params["threadId"]
             th = self.threads[tid]
+            if tid in self.archive_held:
+                raise ValueError(f"thread {tid} already has an active writer")
+            if tid in self.archive_errors:
+                raise ValueError(self.archive_errors[tid])
             if th.get("archived"):
                 raise ValueError(f"no rollout found for thread id {tid}")
             th["archived"] = True
@@ -1354,6 +1360,47 @@ class TestCodexAppCtl(unittest.TestCase):
 
         missing = self._run_cli("retire")
         self.assertNotEqual(missing.returncode, 0)
+
+    def test_retire_reports_each_failure_and_keeps_going(self) -> None:
+        with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
+            ids = {name: cli.start_thread(name=name, cwd=str(self.tmp_path), prompt="Go")["id"]
+                   for name in ("First", "Held", "Broken", "Last")}
+        for tid in ids.values():
+            self._finish_turn(tid, "Report written to out/report.md.")
+        # Another codex process (an open TUI, a plugin's app-server) holds "Held".
+        self.server.archive_held.add(ids["Held"])
+        self.server.archive_errors[ids["Broken"]] = "failed to move rollout: disk full"
+        order = [ids["First"], ids["Held"], "thread-that-does-not-exist", ids["Broken"], ids["Last"]]
+
+        proc = self._run_cli("retire", *order)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        rows = [json.loads(line) for line in proc.stdout.strip().splitlines()]
+        self.assertEqual([r["id"] for r in rows], order)
+        by_id = {r["id"]: r for r in rows}
+
+        self.assertEqual(by_id[ids["First"]]["action"], "archived")
+        self.assertEqual(by_id[ids["Last"]]["action"], "archived")
+        held = by_id[ids["Held"]]
+        self.assertEqual((held["action"], held["reason"], held["name"]), ("skipped", "held_by_other_process", "Held"))
+        self.assertIn("already has an active writer", held["detail"])
+        missing = by_id["thread-that-does-not-exist"]
+        self.assertEqual((missing["action"], missing["error"], missing["method"]), ("error", "CodexRPCError", "thread/read"))
+        broken = by_id[ids["Broken"]]
+        self.assertEqual((broken["action"], broken["method"]), ("error", "thread/archive"))
+        self.assertIn("disk full", broken["detail"])
+        self.assertFalse(self.server.threads[ids["Held"]].get("archived"))
+        self.assertFalse(self.server.threads[ids["Broken"]].get("archived"))
+
+        # A held thread is a skip, not a failure; a dry run cannot know about the hold.
+        held_only = self._run_cli("retire", ids["Held"])
+        self.assertEqual(held_only.returncode, 0, held_only.stdout + held_only.stderr)
+        self.assertEqual(json.loads(held_only.stdout)["reason"], "held_by_other_process")
+        self.assertEqual(json.loads(self._run_cli("retire", ids["Held"], "--dry-run").stdout)["action"], "would_archive")
+
+        # Once the other process lets go, retiring again archives it.
+        self.server.archive_held.clear()
+        self.assertEqual(json.loads(self._run_cli("retire", ids["Held"]).stdout)["action"], "archived")
 
     def test_attention_falls_back_to_rollout_when_turn_summary_has_no_agent_message(self) -> None:
         decision = ("Sweep finished.\n[DECISION-NEEDED]\nQuestion: Drop the stale cohort?\n"

@@ -812,6 +812,12 @@ def _is_archived_error(exc: CodexRPCError) -> bool:
     return "is archived" in (exc.rpc_message or str(exc)).lower()
 
 
+def _is_active_writer_error(exc: CodexRPCError) -> bool:
+    """Another codex process (an open TUI, a plugin's app-server) holds the thread:
+    "thread <id> already has an active writer"."""
+    return "active writer" in (exc.rpc_message or str(exc)).lower()
+
+
 def _is_archived_path(path: Any) -> bool:
     """Archiving moves a thread's rollout under ~/.codex/archived_sessions/."""
     return isinstance(path, str) and "/archived_sessions/" in path.replace("\\", "/")
@@ -1627,6 +1633,8 @@ class CodexAppServerClient:
         decision (`attention`), a failed or interrupted last turn, or a thread in
         `systemError`. Those usually mean the session still has work or a reply
         coming. `dispatch` unarchives a thread on demand, so retiring is reversible.
+        A thread another codex process holds open cannot be archived; it is
+        skipped as `held_by_other_process`. Other RPC errors propagate.
         """
         st = self.thread_status(tid)
         att = st.get("attention") or {}
@@ -1654,8 +1662,13 @@ class CodexAppServerClient:
         elif dry_run:
             rec["action"] = "would_archive"
         else:
-            self.archive_thread(tid)
-            rec["action"] = "archived"
+            try:
+                self.archive_thread(tid)
+                rec["action"] = "archived"
+            except CodexRPCError as exc:
+                if not _is_active_writer_error(exc):
+                    raise
+                rec.update(action="skipped", reason="held_by_other_process", detail=exc.rpc_message)
         return rec
 
     def unarchive_thread(self, tid: str) -> dict[str, Any]:
@@ -2466,11 +2479,21 @@ def main(argv: list[str] | None = None) -> int:
                     ids.extend(_load_ids_from_registry(args.registry))
                 if not ids:
                     parser.error("retire requires at least one thread ID or --registry.")
+                # One thread's failure must not abort the batch: report it and go on.
+                failed = 0
                 for tid in dict.fromkeys(ids):
-                    _print_json(
-                        cli.retire_thread(tid, dry_run=args.dry_run, force=args.force),
-                        pretty=args.pretty,
-                    )
+                    try:
+                        rec = cli.retire_thread(tid, dry_run=args.dry_run, force=args.force)
+                    except (EOFError, ConnectionError, socket.timeout):
+                        raise  # the daemon connection itself failed; later threads would too
+                    except (CodexRPCError, RolloutReadError, OSError) as exc:
+                        failed += 1
+                        rec = {"id": tid, "action": "error", "error": type(exc).__name__, "detail": str(exc)}
+                        if isinstance(exc, CodexRPCError):
+                            rec["method"] = exc.method
+                    _print_json(rec, pretty=args.pretty)
+                if failed:
+                    return 1
 
             elif args.cmd == "unarchive":
                 for tid in args.ids:
