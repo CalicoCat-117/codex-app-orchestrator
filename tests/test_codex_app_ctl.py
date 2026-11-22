@@ -73,6 +73,7 @@ class MockCodexAppServer:
         self.fail_steer_race_once = False
         self.disable_turns_list = False
         self.reject_state_db_only = False
+        self.thread_list_page_max = 100
         self.received_pongs: list[bytes] = []
 
     def start(self) -> None:
@@ -245,8 +246,10 @@ class MockCodexAppServer:
                 rows = [r for r in rows if r.get("cwd") == params["cwd"]]
             if params.get("archived") is False:
                 rows = [r for r in rows if not r.get("archived")]
-            limit = int(params.get("limit", 25))
-            return {"data": rows[:limit], "nextCursor": None}
+            # Like the real server: pages are capped, and `nextCursor` continues the listing.
+            start = int(params.get("cursor") or 0)
+            end = start + min(int(params.get("limit", 25)), self.thread_list_page_max)
+            return {"data": rows[start:end], "nextCursor": str(end) if end < len(rows) else None}
         if method == "thread/start":
             tid = self._new_id("thr")
             model = params.get("model") or self.config["model"]
@@ -566,6 +569,41 @@ class TestCodexAppCtl(unittest.TestCase):
         self.assertEqual(proc_scan.returncode, 0, proc_scan.stderr)
         list_calls_after = [p for m, p in self.server.calls if m == "thread/list"]
         self.assertNotIn("useStateDbOnly", list_calls_after[-1])
+
+    def test_list_follows_next_cursor_past_the_page_cap(self) -> None:
+        for i in range(250):
+            tid = f"bulk-{i:04d}"
+            self.server.threads[tid] = {"id": tid, "name": f"Bulk {i:04d}", "cwd": str(self.tmp_path),
+                                        "status": {"type": "notLoaded"}, "path": None}
+        self.server.loaded.update({"bulk-0180", "bulk-0240"})
+
+        def listed(*args: str) -> tuple[list[str], list[dict]]:
+            before = len(self.server.calls)
+            proc = self._run_cli("list", *args)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            data = json.loads(proc.stdout)
+            self.assertEqual(data["count"], len(data["threads"]))
+            calls = [p for m, p in self.server.calls[before:] if m == "thread/list"]
+            return [t["id"] for t in data["threads"]], calls
+
+        ids, calls = listed("--limit", "500")
+        self.assertEqual(ids, [f"bulk-{i:04d}" for i in range(250)])
+        self.assertEqual([c.get("cursor") for c in calls], [None, "100", "200"])
+        self.assertTrue(all(c["useStateDbOnly"] for c in calls))
+
+        ids, calls = listed("--limit", "120")
+        self.assertEqual(len(ids), 120)
+        self.assertEqual([(c.get("cursor"), c["limit"]) for c in calls], [(None, 120), ("100", 20)])
+
+        self.assertEqual(listed("--search", "Bulk 02", "--limit", "500")[0], [f"bulk-{i:04d}" for i in range(200, 250)])
+        self.assertEqual(listed("--loaded-only", "--limit", "5")[0], ["bulk-0180", "bulk-0240"])
+
+        # The useStateDbOnly fallback for older servers keeps paging without the flag.
+        self.server.reject_state_db_only = True
+        ids, calls = listed("--limit", "500")
+        self.assertEqual(len(ids), 250)
+        self.assertEqual([("useStateDbOnly" in c, c.get("cursor")) for c in calls],
+                         [(True, None), (False, None), (False, "100"), (False, "200")])
 
     def test_loaded_thread_set_policy_note_and_turn_override(self) -> None:
         with ctl.CodexAppServerClient(str(self.sock_path)) as cli:

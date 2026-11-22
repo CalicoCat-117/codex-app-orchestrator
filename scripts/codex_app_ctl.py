@@ -1099,46 +1099,62 @@ class CodexAppServerClient:
         loaded_only: bool = False,
         use_state_db_only: bool = True,
     ) -> list[dict[str, Any]]:
+        """Up to `limit` threads, following `nextCursor` (the server caps a page, at 100 on 0.169)."""
         loaded_set = set(self.list_loaded_threads())
-        params: dict[str, Any] = {"limit": limit}
+        query: dict[str, Any] = {}
         if search:
-            params["searchTerm"] = search
+            query["searchTerm"] = search
         if cwd:
-            params["cwd"] = cwd
+            query["cwd"] = cwd
         if archived is not None:
-            params["archived"] = archived
-        if use_state_db_only:
-            params["useStateDbOnly"] = True
-        try:
-            res = self.rpc("thread/list", params)
-        except CodexRPCError:
-            if not use_state_db_only:
-                raise
-            # Compatibility fallback for older app-server builds without `useStateDbOnly`.
-            params.pop("useStateDbOnly", None)
-            res = self.rpc("thread/list", params)
-        rows = res.get("data") or []
-        out = []
-        for th in rows:
-            tid = th.get("id")
-            is_loaded = tid in loaded_set
-            if loaded_only and not is_loaded:
+            query["archived"] = archived
+        state_db_only = use_state_db_only
+        out: list[dict[str, Any]] = []
+        seen: set[Any] = set()
+        cursor: str | None = None
+        while len(out) < limit:
+            # --loaded-only filters here, after the server's page, so ask for full pages.
+            params = dict(query, limit=max(limit, 100) if loaded_only else limit - len(out))
+            if cursor:
+                params["cursor"] = cursor
+            if state_db_only:
+                params["useStateDbOnly"] = True
+            try:
+                res = self.rpc("thread/list", params)
+            except CodexRPCError:
+                if not state_db_only or cursor:
+                    raise
+                # Compatibility fallback for older app-server builds without `useStateDbOnly`.
+                state_db_only = False
                 continue
-            out.append(
-                {
-                    "id": tid,
-                    "name": th.get("name"),
-                    "cwd": th.get("cwd"),
-                    "model": th.get("model"),
-                    "reasoningEffort": th.get("reasoningEffort"),
-                    "status": th.get("status"),
-                    "loaded": is_loaded,
-                    "source": th.get("source"),
-                    "updatedAt": th.get("updatedAt"),
-                    "path": th.get("path"),
-                    "archived": _is_archived_path(th.get("path")),
-                }
-            )
+            rows = res.get("data") or []
+            for th in rows:
+                tid = th.get("id")
+                is_loaded = tid in loaded_set
+                if tid in seen or (loaded_only and not is_loaded):
+                    continue
+                seen.add(tid)
+                out.append(
+                    {
+                        "id": tid,
+                        "name": th.get("name"),
+                        "cwd": th.get("cwd"),
+                        "model": th.get("model"),
+                        "reasoningEffort": th.get("reasoningEffort"),
+                        "status": th.get("status"),
+                        "loaded": is_loaded,
+                        "source": th.get("source"),
+                        "updatedAt": th.get("updatedAt"),
+                        "path": th.get("path"),
+                        "archived": _is_archived_path(th.get("path")),
+                    }
+                )
+                if len(out) >= limit:
+                    break
+            next_cursor = res.get("nextCursor")
+            if not rows or not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
         return out
 
     def read_thread(self, tid: str, *, include_turns: bool = False) -> dict[str, Any]:
@@ -1990,8 +2006,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s_list.add_argument("--search", default=None, help="Filter threads by search term.")
     s_list.add_argument("--cwd", default=None, help="Filter threads by working directory.")
-    s_list.add_argument("--limit", type=int, default=25, help="Maximum number of threads to return.")
-    s_list.add_argument("--archived", action="store_true", default=None, help="Include archived threads.")
+    s_list.add_argument(
+        "--limit", type=int, default=25, help="Maximum number of threads to return (pages are followed until reached)."
+    )
+    s_list.add_argument(
+        "--archived", action="store_true", default=None, help="List archived threads instead of active ones."
+    )
     s_list.add_argument("--loaded-only", action="store_true", help="Only show currently loaded threads.")
     s_list.add_argument(
         "--scan-rollouts",
