@@ -119,6 +119,12 @@ When running continuous autonomous cycles:
    - Write compact, self-contained round directives (see
      [examples/directive.example.md](../examples/directive.example.md)) and send
      via `codex_app_ctl.py dispatch --thread <ID> --message-file <PATH> --check-quota`.
+   - Archive every slot that gets no next-round work:
+     `codex_app_ctl.py retire <ID>...` (or `--registry FLEET-REGISTRY.json` when
+     the run ends). It skips threads that still have a running turn, a pending
+     question or decision, or a failed/interrupted last turn, so a sweep over the
+     whole registry is safe; read the `skipped` reasons and handle those threads.
+     `dispatch` unarchives a retired thread on demand if it needs another round.
 5. **Log concisely**:
    - Append one timestamped cycle entry to your central supervision log and keep
      the user updated at meaningful milestones (or on blockers/decisions).

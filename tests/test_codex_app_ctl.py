@@ -300,6 +300,8 @@ class MockCodexAppServer:
         if method == "thread/resume":
             tid = params["threadId"]
             th = self.threads[tid]
+            if th.get("archived"):
+                raise ValueError(f"session {tid} is archived. Run `codex unarchive {tid}` to unarchive it first.")
             was_loaded = tid in self.loaded
             self.loaded.add(tid)
             th["status"] = {"type": "idle"}
@@ -363,10 +365,22 @@ class MockCodexAppServer:
             self.threads[tid]["status"] = {"type": "idle"}
             return {}
         if method == "thread/archive":
-            self.threads[params["threadId"]]["archived"] = True
+            # Real daemon: archiving unloads the thread and moves its rollout to
+            # archived_sessions/; archiving again fails because the live rollout is gone.
+            tid = params["threadId"]
+            th = self.threads[tid]
+            if th.get("archived"):
+                raise ValueError(f"no rollout found for thread id {tid}")
+            th["archived"] = True
+            th["_live_path"] = th.get("path")
+            th["path"] = f"/mock/.codex/archived_sessions/rollout-{tid}.jsonl"
+            th["status"] = {"type": "notLoaded"}
+            self.loaded.discard(tid)
             return {}
         if method == "thread/unarchive":
-            self.threads[params["threadId"]]["archived"] = False
+            th = self.threads[params["threadId"]]
+            th["archived"] = False
+            th["path"] = th.pop("_live_path", th.get("path"))
             return {}
         if method == "thread/delete":
             tid = params["threadId"]
@@ -1212,6 +1226,82 @@ class TestCodexAppCtl(unittest.TestCase):
             self.assertFalse(self.server.threads[tid]["archived"])
             self.assertTrue(cli.delete_thread(tid)["deleted"])
             self.assertNotIn(tid, self.server.threads)
+
+    def test_retire_archives_only_threads_with_nothing_left(self) -> None:
+        with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
+            ids = {
+                name: cli.start_thread(name=name, cwd=str(self.tmp_path), prompt="Go")["id"]
+                for name in ("Done", "Asking", "Running", "Failed", "Interrupted", "Earlier")
+            }
+        self._finish_turn(ids["Done"], "Report written to out/report.md. Caption: done.")
+        self._finish_turn(ids["Asking"], "Done.\n[DECISION-NEEDED]\nQuestion: Delete the cache?\nOptions: A) yes | B) no\nRecommended: B - irreversible")
+        self._finish_turn(ids["Failed"], "Crashed.", status="failed")
+        self._finish_turn(ids["Interrupted"], "Stopped.", status="interrupted")
+        self._finish_turn(ids["Earlier"], "Done.")
+        with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
+            cli.archive_thread(ids["Earlier"])
+
+        registry = self.tmp_path / "FLEET-REGISTRY.json"
+        registry.write_text(json.dumps({"sessions": [{"slot": i, "id": tid} for i, tid in enumerate(ids.values())]}), encoding="utf-8")
+
+        def run(*extra: str) -> dict[str, dict]:
+            proc = self._run_cli("retire", "--registry", str(registry), *extra)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return {r["name"]: r for r in map(json.loads, proc.stdout.strip().splitlines())}
+
+        preview = run("--dry-run")
+        self.assertEqual(preview["Done"]["action"], "would_archive")
+        self.assertFalse(self.server.threads[ids["Done"]].get("archived"))
+        expected_skips = {
+            "Asking": "needs_attention:decision_needed",
+            "Running": "turn_in_progress",
+            "Failed": "last_turn_failed",
+            "Interrupted": "last_turn_interrupted",
+            "Earlier": "already_archived",
+        }
+        for name, reason in expected_skips.items():
+            with self.subTest(name=name):
+                self.assertEqual((preview[name]["action"], preview[name]["reason"]), ("skipped", reason))
+
+        applied = run()
+        self.assertEqual(applied["Done"]["action"], "archived")
+        self.assertTrue(self.server.threads[ids["Done"]]["archived"])
+        self.assertFalse(self.server.threads[ids["Asking"]].get("archived"))
+        self.assertEqual(json.loads(self._run_cli("status", ids["Done"]).stdout)["archived"], True)
+
+        # --force covers questions and failed turns, never a running turn.
+        forced = run("--force")
+        for name in ("Asking", "Failed", "Interrupted"):
+            self.assertEqual(forced[name]["action"], "archived", name)
+        self.assertEqual(forced["Running"]["reason"], "turn_in_progress")
+        self.assertEqual(forced["Done"]["reason"], "already_archived")
+
+        missing = self._run_cli("retire")
+        self.assertNotEqual(missing.returncode, 0)
+
+    def test_dispatch_unarchives_archived_thread_first(self) -> None:
+        with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
+            tid = cli.start_thread(name="Retired", cwd=str(self.tmp_path), prompt="Go")["id"]
+            self._finish_turn(tid, "Done.")
+            self.assertEqual(cli.retire_thread(tid)["action"], "archived")
+            self.assertEqual(cli.thread_status(tid)["status_type"], "notLoaded")
+
+            res = cli.dispatch(tid, "One more round: add tests.")
+            self.assertEqual(res["mode"], "turn/start")
+            self.assertTrue(res["resumedFromNotLoaded"])
+            self.assertTrue(res["unarchived"])
+            self.assertFalse(self.server.threads[tid]["archived"])
+            self.assertFalse(cli.thread_status(tid)["archived"])
+            methods = [m for m, _ in self.server.calls]
+            last_turn_start = len(methods) - 1 - methods[::-1].index("turn/start")
+            self.assertLess(methods.index("thread/unarchive"), last_turn_start)
+
+            # Steer-only never revives an archived thread.
+            self._finish_turn(tid, "Done again.")
+            cli.archive_thread(tid)
+            skipped = cli.dispatch(tid, "FYI", steer_only=True)
+            self.assertEqual(skipped["reason"], "thread_not_loaded")
+            self.assertTrue(self.server.threads[tid]["archived"])
 
     def test_skill_markdown_frontmatter_and_relative_links(self) -> None:
         skill_md = REPO_ROOT / "SKILL.md"

@@ -33,6 +33,7 @@ In practice, wiring agents together naively breaks down quickly: headless `codex
 | **`never` / `danger-full-access`** | Eliminates manual UI click-fatigue by stripping away safety guardrails completely. | Defaults to **Guardian `auto_review`** (`approvalPolicy: "on-request"`, `approvalsReviewer: "auto_review"`, `sandbox: "workspace-write"`, `networkAccess: false`), verified against rollout `turn_context`. |
 | **Uncoordinated parallel workers** | Git index lock errors, branch collisions, shared stash corruption, and overwritten reports. | **`launch-batch`** validates isolated `git worktree` + unique `output_dir` boundaries before making any RPC calls and writes a unified `FLEET-REGISTRY.json`. |
 | **Executors that stop to ask** | A turn ends on "should I proceed?" and the thread sits idle until someone notices, or a `request_user_input` call blocks the turn outright. | New sessions get an **autonomy guard** (decide reversible choices, ask only through one `[DECISION-NEEDED]` block). **`status`** flags waiting threads under `attention`, **`watch`** wakes the supervisor the moment a turn ends or a question appears, and **`dispatch`** interrupts and restarts turns blocked on `request_user_input`. |
+| **Finished sessions piling up** | Dozens of idle threads stay in the sidebar after their work ends, hiding the few that are running or waiting on a reply. | **`retire`** archives a thread only when nothing is left for it (no running turn, no pending question, no failed or interrupted last turn) and reports why it skipped the rest. **`dispatch`** unarchives an archived thread before resuming it, so a later follow-up still lands. |
 | **Blind retries during rate limits** | Repeatedly dispatches failing turns or silently drops work when usage limits hit. | **`health`** and `--check-quota` check `account/rateLimits/read` proactively (exiting with code `3` when `ordinaryUsageAllowed` is `false`) to trigger clean pause or authorized failover. |
 
 ---
@@ -97,7 +98,7 @@ For multi-round engineering and research runs spanning hours, `codex-app-orchest
 1. **Preflight Health & Quota Check**: Query daemon status, defaults from `~/.codex/config.toml`, and live rate limits via `account/rateLimits/read`.
 2. **Local-First Artifact Audit**: Run `status --registry FLEET-REGISTRY.json --verify-policy --last-message`, inspect Git commit SHAs in each worktree, and read emitted JSON receipts. Completion is claimed **only from verified artifacts**, never from a thread going `idle` or a scheduler returning success.
 3. **Synthesize & Integrate**: Review deliverables across tracks and instruct Slot 1 to integrate verified commits cleanly.
-4. **Smart Dispatch**: Issue compact, self-contained round directives (using [`examples/directive.example.md`](./examples/directive.example.md)) via `dispatch --check-quota`.
+4. **Smart Dispatch**: Issue compact, self-contained round directives (using [`examples/directive.example.md`](./examples/directive.example.md)) via `dispatch --check-quota`. Slots that get no further work are archived with `retire`.
 5. **Milestone-Aligned Wakeups & Telemetry Hygiene**: Schedule check-ins at real milestones (typically 20–45 minutes) and space any live external telemetry checks by at least 10 seconds (preferring 15–60s+ or passive single-collector logs).
 
 ![Continuous Supervision Loop and Quota-Aware Failover](./assets/04-supervision-failover.jpg)
@@ -254,11 +255,12 @@ python3 scripts/codex_app_ctl.py launch-batch \
 | `caption` | Render a readable, unembellished, principle-first caption from a live thread, registry, or offline rollout. | `--registry`, `--path`, `--max-chars`, `--show-policy`, `--json` |
 | `create` | Create a persistent UI-visible thread (`thread/start` + `thread/name/set` + optional Turn-1 `turn/start`). | `--name`, `--cwd`, `--prompt`, `--prompt-file`, `--approval-policy`, `--approvals-reviewer`, `--sandbox`, `--no-caption-guide`, `--check-quota` |
 | `launch-batch` | Validate isolation constraints, launch/reuse a fleet from JSON spec, and emit `FLEET-REGISTRY.json`. | `--spec`, `--registry-out`, `--dry-run`, `--check-quota` |
-| `dispatch` | Smart non-blocking send: `turn/steer` if `inProgress`, `thread/resume` + `turn/start` if `notLoaded`, `turn/start` if `idle`. | `--thread`, `--message`, `--message-file`, `--steer-only`, `--queue-only`, `--check-quota` |
+| `dispatch` | Smart non-blocking send: `turn/steer` if `inProgress`, `thread/resume` + `turn/start` if `notLoaded` (unarchiving first if archived), `turn/start` if `idle`. | `--thread`, `--message`, `--message-file`, `--steer-only`, `--queue-only`, `--check-quota` |
 | `set-policy` | Apply `approvalPolicy`, `approvalsReviewer`, `sandbox`, and optional `model`/`effort` via `thread/resume`. | `--approval-policy`, `--approvals-reviewer`, `--sandbox`, `--model`, `--effort` |
 | `interrupt` | Gracefully stop an active turn via `turn/interrupt` (auto-detects active turn ID). | `--thread`, `--turn` |
 | `inspect-rollout` | Read-only inspection of rollout JSONL for ground-truth `turn_context`, recent messages, and errors. | `--thread` or `--path` (100% offline), `--last-n` |
-| `archive` / `unarchive` / `delete` | Thread lifecycle cleanup. | `<THREAD_UUID>...` |
+| `retire` | Archive sessions with no follow-up; skips running turns, pending questions or decisions, and failed/interrupted last turns, with a reason per skip. | `<THREAD_UUID>...`, `--registry`, `--dry-run`, `--force` |
+| `archive` / `unarchive` / `delete` | Unchecked thread lifecycle cleanup (`delete` for throwaway smoke tests). | `<THREAD_UUID>...` |
 
 **Exit Codes:** `0` = success · `1` = RPC, socket, or validation error · `3` = quota exhausted (`ordinaryUsageAllowed == false`).
 

@@ -99,6 +99,19 @@ installation is required.
      `developerInstructions` by default (disable with `--no-caption-guide` or
      `"caption_guide": false`), and `caption` extracts and formats clean plain
      captions from live sessions or rollouts.
+8. **Archive sessions that have no follow-up.**
+   - Once a session's results are verified and no further round or reply is
+     planned for it, archive it with `retire`. The thread keeps its full history
+     but leaves the sidebar, so the sessions still in the sidebar are the ones
+     that are working or waiting on you.
+   - `retire` archives only threads with nothing left: it skips a running turn,
+     a pending question or decision (`attention`), and a failed or interrupted
+     last turn, and reports each skip with a reason. `--force` covers the last
+     two after you have handled them; a running turn is never archived
+     (`interrupt` it first).
+   - Archiving is reversible. `dispatch` to an archived thread unarchives it
+     before resuming, so a later follow-up still works.
+   - Use `delete` only for throwaway smoke-test threads.
 
 ## Standard Workflow
 
@@ -195,10 +208,19 @@ only when you intentionally want `codex queue --resume` deferred delivery.
 # Gracefully stop a misdirected active turn
 python3 scripts/codex_app_ctl.py interrupt --thread <THREAD_UUID> --pretty
 
-# Archive finished sessions (keeps history, cleans sidebar) or delete temp ones
+# Archive sessions with no follow-up (checked; preview with --dry-run)
+python3 scripts/codex_app_ctl.py retire <THREAD_UUID>... --pretty
+python3 scripts/codex_app_ctl.py retire --registry /abs/path/to/FLEET-REGISTRY.json --dry-run
+
+# Unchecked archive, or delete throwaway smoke-test threads
 python3 scripts/codex_app_ctl.py archive <THREAD_UUID>
 python3 scripts/codex_app_ctl.py delete <TEMP_THREAD_UUID>
 ```
+
+Each `retire` line reports `action` (`archived`, `would_archive`, or `skipped`
+with a `reason` such as `turn_in_progress`, `needs_attention:decision_needed`,
+`last_turn_failed`, or `already_archived`). `status` shows `archived` per
+thread.
 
 ### 5. Periodic Supervision Loop
 
@@ -213,7 +235,9 @@ When running continuous multi-round research or engineering:
 3. Synthesize findings, decide the next round's directions, write concise
    directive files, and call `dispatch` for each slot that needs new work or
    mid-turn steering. Answer every thread with `attention` set (see rule 6),
-   escalating the decisions that belong to the user.
+   escalating the decisions that belong to the user. `retire` each slot that
+   gets no next-round work (see rule 8), and retire the whole registry when the
+   run ends.
 4. Between check-ins, keep a `watch` running in the background so a finished
    turn or a new question wakes you immediately (exit `0` with `events`; exit
    `4` when `--max-wait` passes with nothing new):
@@ -237,6 +261,8 @@ After creating or updating sessions, verify:
 - `health` reports `daemon.status == "running"` and `quota.ordinaryUsageAllowed == true`.
 - `status --attention-only` prints nothing, or every listed thread has been
   answered or escalated to the user.
+- Sessions with no further work planned have been retired (`status` shows
+  `archived: true`), so the sidebar holds only working or waiting sessions.
 - `health.models.configuredIsNewest` is not `false`. If it is, a newer model of the
   configured family exists; raise it with the user before launching more work.
 - `status --verify-policy` shows `rollout_turn_context.approval_policy == "on-request"`,

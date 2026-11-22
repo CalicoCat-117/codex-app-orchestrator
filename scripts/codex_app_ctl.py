@@ -8,7 +8,8 @@ non-blocking dispatch (`turn/steer` for active turns, `thread/resume` +
 `turn/interrupt` + `turn/start` for turns blocked on `request_user_input`),
 detection of threads waiting on a question or decision (`status`, `watch`), Guardian
 `auto_review` policy management, rollout policy verification, quota health
-checks, and lifecycle teardown.
+checks, and lifecycle teardown (`retire` archives sessions with no follow-up;
+`dispatch` unarchives an archived thread before resuming it).
 """
 
 from __future__ import annotations
@@ -713,6 +714,16 @@ def _is_turn_steer_race_error(exc: CodexRPCError) -> bool:
     return any(tok in msg for tok in indicators)
 
 
+def _is_archived_error(exc: CodexRPCError) -> bool:
+    """`thread/resume` on an archived thread fails with "session <id> is archived"."""
+    return "is archived" in (exc.rpc_message or str(exc)).lower()
+
+
+def _is_archived_path(path: Any) -> bool:
+    """Archiving moves a thread's rollout under ~/.codex/archived_sessions/."""
+    return isinstance(path, str) and "/archived_sessions/" in path.replace("\\", "/")
+
+
 class CodexAppServerClient:
     """RFC 6455 WebSocket JSON-RPC client over the Codex app-server Unix socket."""
 
@@ -1032,6 +1043,7 @@ class CodexAppServerClient:
                     "source": th.get("source"),
                     "updatedAt": th.get("updatedAt"),
                     "path": th.get("path"),
+                    "archived": _is_archived_path(th.get("path")),
                 }
             )
         return out
@@ -1080,6 +1092,7 @@ class CodexAppServerClient:
             "last_turn_error": lt.get("error") if isinstance(lt, dict) else None,
             "updatedAt": th.get("updatedAt"),
             "path": th.get("path"),
+            "archived": _is_archived_path(th.get("path")),
         }
         msg = _extract_agent_message_from_turn(lt)
         flags = status_obj.get("activeFlags") if isinstance(status_obj, dict) else None
@@ -1266,7 +1279,17 @@ class CodexAppServerClient:
         if effort:
             params["config"] = {"model_reasoning_effort": effort}
 
-        res = self.rpc("thread/resume", params)
+        unarchived = False
+        try:
+            res = self.rpc("thread/resume", params)
+        except CodexRPCError as exc:
+            if not _is_archived_error(exc):
+                raise
+            # An archived thread refuses resume. New work for it means the session
+            # is live again, so bring it back to the sidebar and resume.
+            self.rpc("thread/unarchive", {"threadId": tid})
+            unarchived = True
+            res = self.rpc("thread/resume", params)
         th = res.get("thread") or {}
         effective_reviewer = res.get("approvalsReviewer")
         note = None
@@ -1285,6 +1308,7 @@ class CodexAppServerClient:
             "approvalPolicy": res.get("approvalPolicy"),
             "approvalsReviewer": effective_reviewer,
             "sandbox": res.get("sandbox"),
+            "unarchived": unarchived,
             "note": note,
         }
 
@@ -1332,6 +1356,7 @@ class CodexAppServerClient:
         th = self.read_thread(tid, include_turns=False)
         status_type = (th.get("status") or {}).get("type") if isinstance(th.get("status"), dict) else th.get("status")
         resumed = False
+        unarchived = False
         if status_type == "notLoaded":
             if steer_only:
                 return {
@@ -1340,7 +1365,7 @@ class CodexAppServerClient:
                     "threadId": tid,
                     "status": th.get("status"),
                 }
-            self.apply_policy(
+            pol = self.apply_policy(
                 tid,
                 model=model,
                 effort=effort,
@@ -1349,6 +1374,7 @@ class CodexAppServerClient:
                 sandbox=sandbox,
             )
             resumed = True
+            unarchived = bool(pol.get("unarchived"))
             th = self.read_thread(tid, include_turns=False)
 
         lt = self.latest_turn(tid)
@@ -1439,6 +1465,8 @@ class CodexAppServerClient:
         }
         if interrupted_turn_id:
             out["interruptedTurnId"] = interrupted_turn_id
+        if unarchived:
+            out["unarchived"] = True
         return out
 
     def _wait_turn_settled(self, tid: str, turn_id: str, timeout_s: float = 15.0) -> dict[str, Any] | None:
@@ -1475,6 +1503,44 @@ class CodexAppServerClient:
     def archive_thread(self, tid: str) -> dict[str, Any]:
         res = self.rpc("thread/archive", {"threadId": tid})
         return {"threadId": tid, "archived": True, "result": res}
+
+    def retire_thread(self, tid: str, *, dry_run: bool = False, force: bool = False) -> dict[str, Any]:
+        """Archive a thread only when nothing is left for it to do.
+
+        Skips a running turn (always), and unless `force`: a pending question or
+        decision (`attention`), a failed or interrupted last turn, or a thread in
+        `systemError`. Those usually mean the session still has work or a reply
+        coming. `dispatch` unarchives a thread on demand, so retiring is reversible.
+        """
+        st = self.thread_status(tid)
+        att = st.get("attention") or {}
+        rec: dict[str, Any] = {
+            "id": st.get("id") or tid,
+            "name": st.get("name"),
+            "status_type": st.get("status_type"),
+            "last_turn_status": st.get("last_turn_status"),
+            "attention": att.get("kind"),
+        }
+        reason = None
+        if st.get("archived"):
+            reason = "already_archived"
+        elif st.get("status_type") == "active" or st.get("last_turn_status") == "inProgress":
+            reason = "turn_in_progress"
+        elif not force:
+            if att:
+                reason = f"needs_attention:{att.get('kind')}"
+            elif st.get("last_turn_status") in ("failed", "interrupted"):
+                reason = f"last_turn_{st['last_turn_status']}"
+            elif st.get("status_type") == "systemError":
+                reason = "thread_system_error"
+        if reason:
+            rec.update(action="skipped", reason=reason)
+        elif dry_run:
+            rec["action"] = "would_archive"
+        else:
+            self.archive_thread(tid)
+            rec["action"] = "archived"
+        return rec
 
     def unarchive_thread(self, tid: str) -> dict[str, Any]:
         res = self.rpc("thread/unarchive", {"threadId": tid})
@@ -1919,7 +1985,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_disp = sub.add_parser(
         "dispatch",
         parents=[sub_common],
-        help="Smart non-blocking dispatch (`turn/steer` if active, `thread/resume` + `turn/start` if unloaded, `turn/start` if idle, interrupt + `turn/start` if blocked on request_user_input).",
+        help="Smart non-blocking dispatch (`turn/steer` if active, `thread/resume` + `turn/start` if unloaded (unarchiving first if archived), `turn/start` if idle, interrupt + `turn/start` if blocked on request_user_input).",
     )
     s_disp.add_argument("--thread", required=True, help="Target thread UUID.")
     s_disp.add_argument("--message", default=None, help="Directive text (or '-' for stdin).")
@@ -1961,6 +2027,20 @@ def build_parser() -> argparse.ArgumentParser:
     # archive / unarchive / delete
     s_arch = sub.add_parser("archive", parents=[sub_common], help="Archive one or more threads.")
     s_arch.add_argument("ids", nargs="+")
+
+    s_ret = sub.add_parser(
+        "retire",
+        parents=[sub_common],
+        help="Archive sessions with no follow-up; skips running turns, pending questions, and failed/interrupted last turns.",
+    )
+    s_ret.add_argument("ids", nargs="*", help="Thread UUID(s).")
+    s_ret.add_argument("--registry", default=None, help="Load thread IDs from a FLEET-REGISTRY.json file.")
+    s_ret.add_argument("--dry-run", action="store_true", help="Report what would be archived without archiving.")
+    s_ret.add_argument(
+        "--force",
+        action="store_true",
+        help="Also archive threads with pending attention or a failed/interrupted last turn (never a running turn).",
+    )
 
     s_unarch = sub.add_parser("unarchive", parents=[sub_common], help="Unarchive one or more threads.")
     s_unarch.add_argument("ids", nargs="+")
@@ -2259,6 +2339,18 @@ def main(argv: list[str] | None = None) -> int:
             elif args.cmd == "archive":
                 for tid in args.ids:
                     _print_json(cli.archive_thread(tid), pretty=args.pretty)
+
+            elif args.cmd == "retire":
+                ids = list(args.ids)
+                if args.registry:
+                    ids.extend(_load_ids_from_registry(args.registry))
+                if not ids:
+                    parser.error("retire requires at least one thread ID or --registry.")
+                for tid in dict.fromkeys(ids):
+                    _print_json(
+                        cli.retire_thread(tid, dry_run=args.dry_run, force=args.force),
+                        pretty=args.pretty,
+                    )
 
             elif args.cmd == "unarchive":
                 for tid in args.ids:

@@ -45,7 +45,7 @@ speaking JSON-RPC over RFC 6455 WebSocket on a Unix domain socket (`AF_UNIX`).
 | `turn/start` | Start a new turn on an `idle` (loaded) thread | Accepts per-turn overrides (`model`, `effort`, `approvalPolicy`, `approvalsReviewer`, `sandboxPolicy`, `cwd`). |
 | `turn/steer` | Inject input mid-turn into an `inProgress` turn | Requires `expectedTurnId`; prevents commands from stalling in the queue. |
 | `turn/interrupt` | Gracefully interrupt an active turn | Takes `threadId` and active `turnId`. |
-| `thread/archive` / `unarchive` / `delete` | Thread lifecycle cleanup | Use `archive` for completed work, `delete` for smoke tests. |
+| `thread/archive` / `unarchive` / `delete` | Thread lifecycle cleanup | Archiving unloads the thread and moves its rollout to `~/.codex/archived_sessions/` (that is how `status` reports `archived`). `thread/resume` then fails with "session <id> is archived", so `dispatch` calls `thread/unarchive` first; archiving twice fails with "no rollout found". Use `retire` for finished work, `delete` for smoke tests. |
 
 ## 3. UI Visibility: Why `app-server` Beats `codex exec`
 
@@ -135,4 +135,5 @@ transition from `inProgress` to `completed` in the milliseconds between
 | Exit code `3` (`quota_exhausted`) | `ordinaryUsageAllowed == false` or rate-limit reached | Check `resetsAt` from `health`; pause or trigger supervisor failover if authorized. |
 | `set-policy` response still shows old reviewer | Thread is currently loaded in daemon | Next `dispatch` (`turn/start`) applies the per-turn override; verify via `inspect-rollout`. |
 | Directives sit queued and unexecuted | Legacy `codex queue` used while executor stuck in a long turn | Switch to `codex_app_ctl.py dispatch` (triggers `turn/steer`) and enforce Turn-Yielding in prompts. |
+| `RPC thread/resume failed: session <id> is archived` | Thread was archived and an older helper (or raw RPC) tried to resume it | Current `dispatch` unarchives automatically; otherwise run `codex_app_ctl.py unarchive <id>` and retry. |
 | Existing thread stuck on old model in UI | `codex queue` inherits thread model; or thread is mid-turn | Wait for idle (or `interrupt`) and `dispatch --model <target> --effort <level>`. |
