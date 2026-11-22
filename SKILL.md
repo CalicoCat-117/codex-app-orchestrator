@@ -121,6 +121,11 @@ installation is required.
    - `retire` handles each thread on its own. Any other failure is reported as
      `action: "error"` for that thread, the rest of the batch still runs, and
      the command exits `1` if any thread failed.
+   - Archiving moves more than the visible thread: the rollouts of the
+     sub-agents it spawned (`thread_spawn`) go to `~/.codex/archived_sessions/`
+     with it. On one install, retiring 220 threads moved about 2,600 sub-agent
+     rollouts. Guardian `auto_review` reviewer rollouts stay in
+     `~/.codex/sessions/`.
    - Archiving is reversible. `dispatch` to an archived thread unarchives it
      before resuming, so a later follow-up still works.
    - Use `delete` only for throwaway smoke-test threads.

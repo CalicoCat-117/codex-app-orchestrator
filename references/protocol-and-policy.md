@@ -47,6 +47,18 @@ speaking JSON-RPC over RFC 6455 WebSocket on a Unix domain socket (`AF_UNIX`).
 | `turn/interrupt` | Gracefully interrupt an active turn | Takes `threadId` and active `turnId`. |
 | `thread/archive` / `unarchive` / `delete` | Thread lifecycle cleanup | Archiving unloads the thread and moves its rollout to `~/.codex/archived_sessions/` (that is how `status` reports `archived`). `thread/resume` then fails with "session <id> is archived", so `dispatch` calls `thread/unarchive` first; archiving twice fails with "no rollout found". While another codex process holds the thread (an open TUI, or the `codex app-server` child of the Claude Code Codex plugin's `app-server-broker.mjs`), archiving fails with "thread <id> already has an active writer"; `retire` reports that as `held_by_other_process`. Use `retire` for finished work, `delete` for smoke tests. |
 
+### Archiving Moves Sub-Agent Rollouts Too
+
+`thread/archive` moves more than the thread's own rollout. The rollouts of the
+sub-agents the thread spawned (`session_meta.source.subagent.thread_spawn`,
+linked back by `parent_thread_id`) move to `~/.codex/archived_sessions/` with
+it. On one install, retiring 220 threads moved about 2,600 sub-agent rollouts.
+Guardian `auto_review` reviewer rollouts (`source.subagent.other ==
+"guardian"`) are not moved: about 3,400 of them stayed in `~/.codex/sessions/`
+after their parent threads were archived. Sub-agent threads are not in
+`thread/list` results (it defaults to interactive sources), so `list` and
+`retire` never show them; expect far more files to move than threads retired.
+
 ## 3. UI Visibility: Why `app-server` Beats `codex exec`
 
 - `codex exec` and `codex exec resume` execute in a standalone headless process.
