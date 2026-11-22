@@ -89,9 +89,16 @@ python3 scripts/codex_app_ctl.py list --search "topic" --pretty
 If the daemon is not running, start it with `codex app-server daemon start` and
 re-run `health`.
 
+`health.models` compares the configured default model with the newest model the
+server offers in the same family (`gpt-6.2-sol` → the highest `gpt-*-sol`). When
+`configuredIsNewest` is `false`, tell the user and, with their OK, update `model`
+in `~/.codex/config.toml`. `~/.codex/config.toml` is the single source of model
+and effort: leave `--model` / `--effort` unset on `create`, `dispatch`, and fleet
+specs, including quick smoke tests, unless the user asks for a specific value.
+
 ### 2. Launch a Single Executor or Parallel Fleet
 
-**Single session** (inherits `~/.codex/config.toml` model/effort unless passed):
+**Single session** (inherits `~/.codex/config.toml` model/effort; do not override them unasked):
 
 ```bash
 python3 scripts/codex_app_ctl.py create \
@@ -188,6 +195,8 @@ When running continuous multi-round research or engineering:
 After creating or updating sessions, verify:
 
 - `health` reports `daemon.status == "running"` and `quota.ordinaryUsageAllowed == true`.
+- `health.models.configuredIsNewest` is not `false`. If it is, a newer model of the
+  configured family exists; raise it with the user before launching more work.
 - `status --verify-policy` shows `rollout_turn_context.approval_policy == "on-request"`,
   `approvals_reviewer == "auto_review"`, and expected `model` / `effort` / `sandbox_policy`.
 - Every writer slot in `FLEET-REGISTRY.json` points to a distinct worktree/branch

@@ -58,6 +58,9 @@ class MockCodexAppServer:
             },
         }
         self.threads: dict[str, dict[str, Any]] = {}
+        self.models: list[dict[str, Any]] | None = [
+            {"id": "gpt-test-model", "supportedReasoningEfforts": [{"reasoningEffort": "max"}]},
+        ]
         self.loaded: set[str] = set()
         self.turns: dict[str, list[dict[str, Any]]] = {}
         self._seq = 1
@@ -223,6 +226,13 @@ class MockCodexAppServer:
             return dict(self.rate_limits)
         if method == "thread/loaded/list":
             return {"data": sorted(self.loaded), "nextCursor": None}
+        if method == "model/list":
+            if self.models is None:
+                raise ValueError("model/list not supported")
+            # Two pages, to exercise cursor handling.
+            if params.get("cursor") == "page2":
+                return {"data": self.models[1:], "nextCursor": None}
+            return {"data": self.models[:1], "nextCursor": "page2" if len(self.models) > 1 else None}
         if method == "thread/list":
             if self.reject_state_db_only and "useStateDbOnly" in params:
                 raise ValueError("unknown field `useStateDbOnly`")
@@ -420,6 +430,41 @@ class TestCodexAppCtl(unittest.TestCase):
         self.assertEqual(proc_q.returncode, 3)
         err = json.loads(proc_q.stdout)
         self.assertEqual(err["error"], "quota_exhausted")
+
+    def test_health_reports_newest_model_in_family(self) -> None:
+        self.assertEqual(ctl.newest_in_family(["gpt-6-sol", "gpt-6.2-sol", "gpt-5.6-sol", "gpt-6.3-astra"], "gpt-6.1-sol"), "gpt-6.2-sol")
+        self.assertEqual(ctl.newest_in_family(["gpt-6.10-sol", "gpt-6.9-sol"], "gpt-6.9-sol"), "gpt-6.10-sol")
+        self.assertIsNone(ctl.newest_in_family(["gpt-6.2-sol"], "codex-auto-review"))
+
+        # Unparseable configured model: reported, no verdict, no warning.
+        data = json.loads(self._run_cli("health").stdout)
+        self.assertIsNone(data["models"]["configuredIsNewest"])
+        self.assertEqual(data["models"]["warnings"], [])
+
+        # Configured default is the newest sol.
+        self.server.config["model"] = "gpt-6.2-sol"
+        self.server.models = [
+            {"id": "gpt-6.2-sol", "supportedReasoningEfforts": [{"reasoningEffort": "max"}, {"reasoningEffort": "ultra"}]},
+            {"id": "gpt-6.2-astra"},
+            {"id": "gpt-6.1-sol"},
+        ]
+        fresh = json.loads(self._run_cli("health").stdout)["models"]
+        self.assertTrue(fresh["configuredIsNewest"])
+        self.assertEqual(fresh["supportedEfforts"], ["max", "ultra"])
+        self.assertEqual(fresh["warnings"], [])
+
+        # A newer sol ships: health flags it (found on the second page).
+        self.server.models.append({"id": "gpt-6.3-sol"})
+        stale = json.loads(self._run_cli("health").stdout)["models"]
+        self.assertFalse(stale["configuredIsNewest"])
+        self.assertEqual(stale["newestInFamily"], "gpt-6.3-sol")
+        self.assertIn("gpt-6.3-sol", stale["warnings"][0])
+
+        # Older servers without model/list still report health.
+        self.server.models = None
+        proc = self._run_cli("health")
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("model/list not supported", json.loads(proc.stdout)["models"]["error"])
 
     def test_create_defaults_guardian_auto_review_and_persistent(self) -> None:
         with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
