@@ -191,11 +191,15 @@ def _rollout_source(path: str | Path) -> Path | None:
     return compressed if compressed.exists() else None
 
 
+# Rollout lines holding tool output can run to megabytes; a larger buffer cuts read calls.
+_ROLLOUT_READ_BUFFER = 1 << 20
+
+
 @contextlib.contextmanager
 def _rollout_lines(src: Path) -> Iterator[Iterable[bytes]]:
     """Yield a rollout's raw lines, streaming `.zst` files through the `zstd` CLI (no Python deps)."""
     if src.suffix != ".zst":
-        with src.open("rb") as fh:
+        with src.open("rb", buffering=_ROLLOUT_READ_BUFFER) as fh:
             yield fh
         return
     zstd = shutil.which("zstd")
@@ -205,7 +209,10 @@ def _rollout_lines(src: Path) -> Iterator[Iterable[bytes]]:
             "(for example `apt install zstd` or `brew install zstd`) to read compressed rollouts."
         )
     proc = subprocess.Popen(
-        [zstd, "-d", "-c", "-q", "--", str(src)], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        [zstd, "-d", "-c", "-q", "--", str(src)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=_ROLLOUT_READ_BUFFER,
     )
     read_to_end = False
     try:
@@ -616,6 +623,13 @@ def resolve_socket_path(
     )
 
 
+# Every record inspect_rollout_file uses carries one of these JSON strings, so other
+# lines (mostly large tool output) are skipped before JSON parsing.
+_ROLLOUT_LINE_HINT_RE = re.compile(
+    rb'"(?:turn_context|assistant|task_started|task_complete|error|turn_aborted|warning)"'
+)
+
+
 def inspect_rollout_file(
     path: str | Path,
     last_n: int = 5,
@@ -653,6 +667,8 @@ def inspect_rollout_file(
 
     with _rollout_lines(src) as lines:
         for raw in lines:
+            if not _ROLLOUT_LINE_HINT_RE.search(raw):
+                continue
             line = raw.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
