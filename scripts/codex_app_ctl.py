@@ -1095,26 +1095,33 @@ class CodexAppServerClient:
             "archived": _is_archived_path(th.get("path")),
         }
         msg = _extract_agent_message_from_turn(lt)
+        msg_source = "turn" if msg is not None else None
+        # The turn summary often leaves out the agent message (notLoaded threads,
+        # compaction turns). When a finished turn's attention or --last-message
+        # needs it, take the last assistant text from the rollout instead.
+        wants_msg = include_last_message or out["last_turn_status"] not in (None, "inProgress")
+        rollout: dict[str, Any] | None = None
+        if th.get("path") and (verify_policy or (msg is None and wants_msg)):
+            rollout = inspect_rollout_file(th["path"], last_n=3, include_full_last_message=True)
+        if msg is None and wants_msg and rollout and rollout.get("last_assistant_text"):
+            msg, msg_source = rollout["last_assistant_text"], "rollout"
         flags = status_obj.get("activeFlags") if isinstance(status_obj, dict) else None
         pending = (
             pending_user_input_questions(th.get("path"))
             if isinstance(flags, list) and "waitingOnUserInput" in flags
             else None
         )
-        out["attention"] = classify_attention(
+        attention = classify_attention(
             status_obj, out["last_turn_status"], msg, pending_questions=pending
         )
-        if include_last_message:
-            if msg is not None:
-                out["last_agent_message"] = msg[:1000]
-        if verify_policy and th.get("path"):
-            rollout = inspect_rollout_file(th["path"], last_n=3)
+        if attention and attention["kind"] in ("decision_needed", "question"):
+            attention["message_source"] = msg_source
+        out["attention"] = attention
+        if include_last_message and msg is not None:
+            out["last_agent_message"] = msg[:1000]
+        if verify_policy and rollout is not None:
             out["rollout_turn_context"] = rollout.get("last_turn_context")
             out["rollout_recent_errors"] = rollout.get("recent_errors")
-            if include_last_message and "last_agent_message" not in out:
-                msgs = rollout.get("recent_assistant_messages") or []
-                if msgs:
-                    out["last_agent_message"] = msgs[-1]["preview"]
         return out
 
     def thread_caption(

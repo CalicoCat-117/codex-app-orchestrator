@@ -840,6 +840,42 @@ class TestCodexAppCtl(unittest.TestCase):
         turn["items"].append({"type": "agentMessage", "text": text})
         self.server.threads[tid]["status"] = {"type": "idle"}
 
+    @staticmethod
+    def _rollout_turn(turn_id: str, text: str | None, end: str | None = "complete") -> list[dict]:
+        events: list[dict] = [
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}},
+            {"type": "turn_context", "payload": {"turn_id": turn_id, "model": "gpt-test-model", "effort": "max",
+                                                 "approval_policy": "on-request", "approvals_reviewer": "auto_review",
+                                                 "sandbox_policy": {"type": "workspace-write"}, "cwd": "/w"}},
+            {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                                  "content": [{"type": "input_text", "text": "Go"}]}},
+        ]
+        if text is not None:
+            events.append({"type": "response_item", "payload": {
+                "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}})
+        if end == "complete":
+            events.append({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": turn_id}})
+        return events
+
+    def _write_rollout(self, name: str, events: list[dict]) -> Path:
+        path = self.tmp_path / name
+        path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+        return path
+
+    def _park_thread(self, tid: str, rollout: Path, *, summary_text: str | None = None) -> None:
+        """Make a thread look like a real notLoaded one: completed turn, summary items, rollout on disk.
+
+        The daemon's `summary` view of a notLoaded thread's turn often carries only the
+        user message, so the agent's closing text is only in the rollout.
+        """
+        turn = self.server.turns[tid][-1]
+        turn["status"] = "completed"
+        turn["itemsView"] = "summary"
+        if summary_text is not None:
+            turn["items"].append({"type": "agentMessage", "text": summary_text})
+        self.server.threads[tid].update(status={"type": "notLoaded"}, path=str(rollout))
+        self.server.loaded.discard(tid)
+
     def test_attention_classification(self) -> None:
         idle = {"type": "idle"}
         block = (
@@ -1278,6 +1314,46 @@ class TestCodexAppCtl(unittest.TestCase):
 
         missing = self._run_cli("retire")
         self.assertNotEqual(missing.returncode, 0)
+
+    def test_attention_falls_back_to_rollout_when_turn_summary_has_no_agent_message(self) -> None:
+        decision = ("Sweep finished.\n[DECISION-NEEDED]\nQuestion: Drop the stale cohort?\n"
+                    "Options: A) drop | B) keep\nRecommended: B - irreversible")
+        with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
+            ids = {name: cli.start_thread(name=name, cwd=str(self.tmp_path), prompt="Go")["id"]
+                   for name in ("Deciding", "Asking", "Done", "Summarised")}
+        self._park_thread(ids["Deciding"], self._write_rollout(
+            "deciding.jsonl", self._rollout_turn("t1", "Earlier round done.") + self._rollout_turn("t2", decision)))
+        self._park_thread(ids["Asking"], self._write_rollout(
+            "asking.jsonl", self._rollout_turn("t1", "Patch is ready. Should I proceed with the migration?")))
+        self._park_thread(ids["Done"], self._write_rollout(
+            "done.jsonl", self._rollout_turn("t1", "Report written to out/report.md.")))
+        # A summary that does carry the agent message wins over the rollout.
+        self._park_thread(ids["Summarised"], self._write_rollout(
+            "summarised.jsonl", self._rollout_turn("t1", decision)), summary_text="All done; nothing pending.")
+
+        proc = self._run_cli("status", *ids.values(), "--last-message")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = {r["name"]: r for r in map(json.loads, proc.stdout.strip().splitlines())}
+        deciding = rows["Deciding"]["attention"]
+        self.assertEqual((deciding["kind"], deciding["message_source"]), ("decision_needed", "rollout"))
+        self.assertEqual(deciding["question"], "Drop the stale cohort?")
+        self.assertTrue(rows["Deciding"]["last_agent_message"].startswith("Sweep finished."))
+        self.assertEqual((rows["Asking"]["attention"]["kind"], rows["Asking"]["attention"]["message_source"]),
+                         ("question", "rollout"))
+        self.assertIsNone(rows["Done"]["attention"])
+        self.assertIsNone(rows["Summarised"]["attention"])
+        self.assertEqual(rows["Summarised"]["last_agent_message"], "All done; nothing pending.")
+
+        # retire keeps the threads that wait on a reply and archives the finished one.
+        proc = self._run_cli("retire", *ids.values())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        retired = {r["name"]: r for r in map(json.loads, proc.stdout.strip().splitlines())}
+        self.assertEqual(retired["Deciding"]["reason"], "needs_attention:decision_needed")
+        self.assertEqual(retired["Asking"]["reason"], "needs_attention:question")
+        self.assertEqual(retired["Done"]["action"], "archived")
+        self.assertEqual(retired["Summarised"]["action"], "archived")
+        self.assertFalse(self.server.threads[ids["Deciding"]].get("archived"))
+        self.assertFalse(self.server.threads[ids["Asking"]].get("archived"))
 
     def test_dispatch_unarchives_archived_thread_first(self) -> None:
         with ctl.CodexAppServerClient(str(self.sock_path)) as cli:

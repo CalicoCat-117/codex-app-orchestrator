@@ -251,7 +251,7 @@ python3 scripts/codex_app_ctl.py launch-batch \
 | :--- | :--- | :--- |
 | `health` | Query daemon version, socket path, configured defaults, quota (`account/rateLimits/read`), and loaded threads. | `--pretty` |
 | `list` | Search/list persisted or loaded threads (state-DB-only by default for millisecond lookups). | `--search`, `--cwd`, `--limit`, `--archived`, `--loaded-only`, `--scan-rollouts` |
-| `status` | O(1) live status + latest turn check via `thread/turns/list`. | `--registry`, `--verify-policy`, `--last-message` |
+| `status` | Live status + latest turn check via `thread/turns/list` (`limit: 1`), with `attention` for threads waiting on a reply. Reads the rollout only when the turn summary lacks the agent's closing message. | `--registry`, `--verify-policy`, `--last-message`, `--attention-only` |
 | `caption` | Render a readable, unembellished, principle-first caption from a live thread, registry, or offline rollout. | `--registry`, `--path`, `--max-chars`, `--show-policy`, `--json` |
 | `create` | Create a persistent UI-visible thread (`thread/start` + `thread/name/set` + optional Turn-1 `turn/start`). | `--name`, `--cwd`, `--prompt`, `--prompt-file`, `--approval-policy`, `--approvals-reviewer`, `--sandbox`, `--no-caption-guide`, `--check-quota` |
 | `launch-batch` | Validate isolation constraints, launch/reuse a fleet from JSON spec, and emit `FLEET-REGISTRY.json`. | `--spec`, `--registry-out`, `--dry-run`, `--check-quota` |

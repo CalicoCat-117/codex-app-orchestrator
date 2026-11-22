@@ -79,6 +79,10 @@ installation is required.
      `waiting_on_approval`, `decision_needed` (with parsed `question`,
      `options`, `recommended`), or `question` (heuristic: the turn ended on a
      prose question). `status --attention-only` lists just those threads.
+   - The turn summary of a `notLoaded` thread often leaves out the agent's
+     closing message. `status` then reads the last assistant message from the
+     thread's rollout, and `attention.message_source` says where the message
+     came from (`turn` or `rollout`).
    - Between check-ins, run `watch` in the background. It returns as soon as a
      watched turn finishes or a thread needs attention, so the supervisor wakes
      on the event instead of the next timer.
