@@ -192,6 +192,12 @@ python3 scripts/codex_app_ctl.py caption <THREAD_UUID> --json --pretty
 python3 scripts/codex_app_ctl.py inspect-rollout --thread <THREAD_UUID> --pretty
 ```
 
+Codex compresses older rollouts to `<rollout>.jsonl.zst` while the app-server
+keeps reporting the `.jsonl` path. The helper reads the compressed copy through
+the `zstd` command-line tool. If `zstd` is not installed, commands that need
+such a rollout fail with `RolloutReadError`; install `zstd` rather than
+treating the rollout as missing.
+
 Deliver a new round directive or mid-turn correction without blocking:
 
 ```bash

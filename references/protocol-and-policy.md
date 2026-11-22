@@ -115,6 +115,19 @@ Confirm `last_turn_context` matches:
 - `sandbox_policy.type == "workspace-write"` (or `"read-only"`)
 - expected `model` and `effort`
 
+### Compressed Rollouts
+
+Codex compresses older rollouts in place to `<rollout>.jsonl.zst`, while
+`thread/read` and `thread/list` keep reporting the `.jsonl` path. When that path
+is missing and `<path>.zst` exists, `codex_app_ctl.py` streams the compressed
+copy through the `zstd -dc` command-line tool (Python stays dependency-free).
+This covers `inspect-rollout`, `caption`, `status --verify-policy`, the
+`request_user_input` lookup, and the attention fallback that `status`, `watch`,
+and `retire` use when a turn summary lacks the agent message.
+`inspect-rollout` reports `compressed: true` for such a file. If `zstd` is not
+installed, or it cannot decompress the file, the command fails with a
+`RolloutReadError` naming the file instead of reporting the rollout as missing.
+
 ## 5. Handling `turn/steer` Race Conditions
 
 Because `turn/steer` enforces `expectedTurnId` as a precondition, a thread can
@@ -136,4 +149,5 @@ transition from `inProgress` to `completed` in the milliseconds between
 | `set-policy` response still shows old reviewer | Thread is currently loaded in daemon | Next `dispatch` (`turn/start`) applies the per-turn override; verify via `inspect-rollout`. |
 | Directives sit queued and unexecuted | Legacy `codex queue` used while executor stuck in a long turn | Switch to `codex_app_ctl.py dispatch` (triggers `turn/steer`) and enforce Turn-Yielding in prompts. |
 | `RPC thread/resume failed: session <id> is archived` | Thread was archived and an older helper (or raw RPC) tried to resume it | Current `dispatch` unarchives automatically; otherwise run `codex_app_ctl.py unarchive <id>` and retry. |
+| `RolloutReadError: Rollout ....jsonl.zst is zstd-compressed and the zstd command is not on PATH` | Codex compressed the thread's rollout and the `zstd` CLI is missing | Install `zstd` (`apt install zstd` / `brew install zstd`) and retry. |
 | Existing thread stuck on old model in UI | `codex queue` inherits thread model; or thread is mid-turn | Wait for idle (or `interrupt`) and `dispatch --model <target> --effort <level>`. |

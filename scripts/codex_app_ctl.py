@@ -16,16 +16,19 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import json
 import os
 import re
+import shutil
 import socket
 import struct
 import subprocess
 import sys
 import time
+from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Iterator
 
 CLIENT_INFO = {
     "name": "codex-app-orchestrator",
@@ -172,20 +175,85 @@ def classify_attention(
     return None
 
 
+class RolloutReadError(RuntimeError):
+    """A rollout exists but cannot be read (for example, it is zstd-compressed and `zstd` is missing)."""
+
+
+def _rollout_source(path: str | Path) -> Path | None:
+    """The file that holds a rollout: `path` itself, or the `<path>.zst` Codex compresses it into.
+
+    `thread/read` and `thread/list` keep reporting the `.jsonl` path after compression.
+    """
+    p = Path(path)
+    if p.exists():
+        return p
+    compressed = Path(f"{p}.zst")
+    return compressed if compressed.exists() else None
+
+
+@contextlib.contextmanager
+def _rollout_lines(src: Path) -> Iterator[Iterable[bytes]]:
+    """Yield a rollout's raw lines, streaming `.zst` files through the `zstd` CLI (no Python deps)."""
+    if src.suffix != ".zst":
+        with src.open("rb") as fh:
+            yield fh
+        return
+    zstd = shutil.which("zstd")
+    if not zstd:
+        raise RolloutReadError(
+            f"Rollout {src} is zstd-compressed and the `zstd` command is not on PATH. Install zstd "
+            "(for example `apt install zstd` or `brew install zstd`) to read compressed rollouts."
+        )
+    proc = subprocess.Popen(
+        [zstd, "-d", "-c", "-q", "--", str(src)], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    read_to_end = False
+    try:
+        yield proc.stdout
+        read_to_end = proc.stdout.read(1) == b""
+    finally:
+        if not read_to_end:
+            # The reader stopped early or failed; zstd may be blocked on a full pipe.
+            proc.kill()
+        proc.stdout.close()
+        err = proc.stderr.read().decode("utf-8", errors="replace").strip()
+        proc.stderr.close()
+        returncode = proc.wait()
+    if read_to_end and returncode != 0:
+        raise RolloutReadError(f"zstd could not decompress {src} (exit {returncode}): {err or 'no message'}")
+
+
+def _rollout_tail_lines(src: Path, tail_bytes: int) -> list[str]:
+    """Decoded lines from the last `tail_bytes` of a rollout; a compressed one is streamed to its end."""
+    if src.suffix != ".zst":
+        size = src.stat().st_size
+        with src.open("rb") as fh:
+            if size > tail_bytes:
+                fh.seek(size - tail_bytes)
+            return fh.read().decode("utf-8", errors="ignore").splitlines()
+    window: deque[bytes] = deque()
+    kept = 0
+    with _rollout_lines(src) as lines:
+        for raw in lines:
+            window.append(raw)
+            kept += len(raw)
+            while kept > tail_bytes and len(window) > 1:
+                kept -= len(window.popleft())
+    return [raw.decode("utf-8", errors="ignore").rstrip("\r\n") for raw in window]
+
+
 def pending_user_input_questions(rollout_path: str | None, tail_bytes: int = 65536) -> list[Any]:
     """Questions from the newest `request_user_input` call in a rollout's tail, if any."""
     if not rollout_path:
         return []
-    p = Path(rollout_path)
+    src = _rollout_source(rollout_path)
+    if src is None:
+        return []
     try:
-        size = p.stat().st_size
-        with p.open("rb") as fh:
-            if size > tail_bytes:
-                fh.seek(size - tail_bytes)
-            raw = fh.read().decode("utf-8", errors="ignore")
+        lines = _rollout_tail_lines(src, tail_bytes)
     except OSError:
         return []
-    for line in reversed(raw.splitlines()):
+    for line in reversed(lines):
         if "request_user_input" not in line:
             continue
         try:
@@ -391,7 +459,7 @@ def rollout_caption(
     return {
         "id": None,
         "slot": None,
-        "name": name or p.stem,
+        "name": name or Path(p.name[: -len(".zst")] if p.suffix == ".zst" else p.name).stem,
         # Read from the file alone, so the live thread state is unknown.
         "status_type": "offline",
         "last_turn_id": last_turn_id,
@@ -561,10 +629,16 @@ def inspect_rollout_file(
     any error/rate-limit events (tagged with the turn they belong to), and the
     id and terminal state of the most recent turn (`last_turn_status`:
     `inProgress`, `completed`, `interrupted`, or `aborted`).
+
+    Reads `<path>.zst` when Codex has compressed the rollout (`compressed: true`;
+    `size_bytes` is then the compressed size). Raises RolloutReadError when that
+    copy cannot be decompressed, so a compressed rollout never reads as missing.
     """
     p = Path(path)
-    if not p.exists():
+    src = _rollout_source(p)
+    if src is None:
         return {"exists": False, "path": str(p)}
+    size_bytes = src.stat().st_size
 
     last_turn_context: dict[str, Any] | None = None
     turn_context_count = 0
@@ -577,14 +651,16 @@ def inspect_rollout_file(
     current_turn_id: str | None = None
     current_turn_status: str | None = None
 
-    with p.open("r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            line = line.strip()
+    with _rollout_lines(src) as lines:
+        for raw in lines:
+            line = raw.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
                 continue
 
             entry_type = obj.get("type")
@@ -660,7 +736,8 @@ def inspect_rollout_file(
     result: dict[str, Any] = {
         "exists": True,
         "path": str(p),
-        "size_bytes": p.stat().st_size,
+        "compressed": src.suffix == ".zst",
+        "size_bytes": size_bytes,
         "turn_context_count": turn_context_count,
         "task_complete_count": task_completes,
         "last_turn_id": current_turn_id,

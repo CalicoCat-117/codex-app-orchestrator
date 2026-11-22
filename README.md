@@ -206,6 +206,7 @@ cp -r /path/to/codex-app-orchestrator "${CODEX_HOME:-$HOME/.codex}/skills/codex-
 - **Python `>= 3.9`** (standard library only — zero external packages).
 - **Codex CLI** with local `app-server` daemon support (tested with `codex-cli 0.169.0` on Linux).
 - Running local daemon (`codex app-server daemon start` if not already active).
+- **`zstd` command-line tool** for older threads. Codex compresses older rollouts to `<rollout>.jsonl.zst`, and the controller streams those through `zstd -dc` (`apt install zstd` / `brew install zstd`). Without it, commands that need such a rollout fail with a `RolloutReadError` naming the file.
 
 ---
 
@@ -258,7 +259,7 @@ python3 scripts/codex_app_ctl.py launch-batch \
 | `dispatch` | Smart non-blocking send: `turn/steer` if `inProgress`, `thread/resume` + `turn/start` if `notLoaded` (unarchiving first if archived), `turn/start` if `idle`. | `--thread`, `--message`, `--message-file`, `--steer-only`, `--queue-only`, `--check-quota` |
 | `set-policy` | Apply `approvalPolicy`, `approvalsReviewer`, `sandbox`, and optional `model`/`effort` via `thread/resume`. | `--approval-policy`, `--approvals-reviewer`, `--sandbox`, `--model`, `--effort` |
 | `interrupt` | Gracefully stop an active turn via `turn/interrupt` (auto-detects active turn ID). | `--thread`, `--turn` |
-| `inspect-rollout` | Read-only inspection of rollout JSONL for ground-truth `turn_context`, recent messages, and errors. | `--thread` or `--path` (100% offline), `--last-n` |
+| `inspect-rollout` | Read-only inspection of rollout JSONL (plain or `zstd`-compressed `.jsonl.zst`) for ground-truth `turn_context`, recent messages, and errors. | `--thread` or `--path` (100% offline), `--last-n` |
 | `retire` | Archive sessions with no follow-up; skips running turns, pending questions or decisions, and failed/interrupted last turns, with a reason per skip. | `<THREAD_UUID>...`, `--registry`, `--dry-run`, `--force` |
 | `archive` / `unarchive` / `delete` | Unchecked thread lifecycle cleanup (`delete` for throwaway smoke tests). | `<THREAD_UUID>...` |
 

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -403,13 +404,14 @@ class TestCodexAppCtl(unittest.TestCase):
         self.server.stop()
         self.tmpdir.cleanup()
 
-    def _run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
+    def _run_cli(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(SCRIPTS_DIR / "codex_app_ctl.py"), "--socket", str(self.sock_path), *args],
             capture_output=True,
             text=True,
             timeout=15,
             check=False,
+            env=env,
         )
 
     def test_websocket_fragmentation_ping_and_large_payload(self) -> None:
@@ -1354,6 +1356,82 @@ class TestCodexAppCtl(unittest.TestCase):
         self.assertEqual(retired["Summarised"]["action"], "archived")
         self.assertFalse(self.server.threads[ids["Deciding"]].get("archived"))
         self.assertFalse(self.server.threads[ids["Asking"]].get("archived"))
+
+    @unittest.skipUnless(shutil.which("zstd"), "needs the zstd CLI")
+    def test_compressed_rollouts_are_read_through_zstd(self) -> None:
+        # Codex compresses older rollouts to `<path>.zst`, but thread/read keeps reporting `<path>`.
+        decision = "Done.\n[DECISION-NEEDED]\nQuestion: Publish the report?\nOptions: A) yes | B) no\nRecommended: B - external"
+        plain = self._write_rollout("rollout-old.jsonl", self._rollout_turn("t1", decision))
+        subprocess.run(["zstd", "-q", "--rm", str(plain)], check=True)
+        self.assertFalse(plain.exists())
+        self.assertTrue(Path(f"{plain}.zst").exists())
+
+        call = {"type": "response_item", "payload": {"type": "function_call", "name": "request_user_input",
+                "arguments": json.dumps({"questions": [{"id": "q1", "question": "Which dataset?"}]})}}
+        waiting_rollout = self._write_rollout("rollout-waiting.jsonl", [{"type": "event_msg", "payload": {"type": "warning", "message": "x" * 300}}] * 400 + [call])
+        subprocess.run(["zstd", "-q", "--rm", str(waiting_rollout)], check=True)
+
+        with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
+            tid = cli.start_thread(name="Compressed", cwd=str(self.tmp_path), prompt="Go")["id"]
+            waiting = cli.start_thread(name="Waiting", cwd=str(self.tmp_path), prompt="Go")["id"]
+        self._park_thread(tid, plain)
+        self.server.threads[waiting].update(path=str(waiting_rollout),
+                                            status={"type": "active", "activeFlags": ["waitingOnUserInput"]})
+
+        offline = json.loads(self._run_cli("inspect-rollout", "--path", str(plain)).stdout)
+        self.assertTrue(offline["exists"])
+        self.assertTrue(offline["compressed"])
+        self.assertEqual(offline["path"], str(plain))
+        self.assertEqual(offline["last_turn_status"], "completed")
+        self.assertEqual(offline["last_turn_context"]["approvals_reviewer"], "auto_review")
+        self.assertEqual(json.loads(self._run_cli("inspect-rollout", "--thread", tid).stdout), offline)
+
+        st = json.loads(self._run_cli("status", tid, "--verify-policy").stdout)
+        self.assertEqual(st["rollout_turn_context"]["approval_policy"], "on-request")
+        self.assertEqual((st["attention"]["kind"], st["attention"]["question"]), ("decision_needed", "Publish the report?"))
+        waiting_st = json.loads(self._run_cli("status", waiting).stdout)
+        self.assertEqual(waiting_st["attention"]["questions"][0]["question"], "Which dataset?")
+
+        cap = json.loads(self._run_cli("caption", tid, "--json").stdout)
+        self.assertEqual(cap["caption_source"], "latest_message")
+        self.assertIn("Publish the report?", cap["caption"])
+        offline_cap = self._run_cli("caption", "--path", f"{plain}.zst")
+        self.assertEqual(offline_cap.returncode, 0, offline_cap.stdout + offline_cap.stderr)
+        self.assertTrue(offline_cap.stdout.startswith("rollout-old — offline (last turn completed)"), offline_cap.stdout)
+
+        retired = json.loads(self._run_cli("retire", tid).stdout)
+        self.assertEqual(retired["reason"], "needs_attention:decision_needed")
+
+        # A damaged compressed rollout is an error, not an empty or missing rollout.
+        Path(self.tmp_path / "rollout-bad.jsonl.zst").write_bytes(b"not zstd data")
+        bad = self._run_cli("inspect-rollout", "--path", str(self.tmp_path / "rollout-bad.jsonl"))
+        self.assertEqual(bad.returncode, 1, bad.stdout + bad.stderr)
+        err = json.loads(bad.stdout)
+        self.assertEqual(err["error"], "RolloutReadError")
+        self.assertIn("zstd could not decompress", err["detail"])
+
+    def test_compressed_rollout_without_zstd_fails_clearly(self) -> None:
+        rollout = self.tmp_path / "rollout-old.jsonl"
+        Path(f"{rollout}.zst").write_bytes(b"(zstd frame)")  # never decompressed: zstd is missing
+        no_zstd = dict(os.environ, PATH=str(self.tmp_path / "empty-bin"))
+
+        with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
+            tid = cli.start_thread(name="Compressed", cwd=str(self.tmp_path), prompt="Go")["id"]
+        self._park_thread(tid, rollout)
+
+        for args in (("inspect-rollout", "--path", str(rollout)), ("inspect-rollout", "--thread", tid),
+                     ("status", tid), ("caption", tid), ("caption", "--path", str(rollout))):
+            with self.subTest(args=args[:2]):
+                proc = self._run_cli(*args, env=no_zstd)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                err = json.loads(proc.stdout)
+                self.assertEqual(err["error"], "RolloutReadError")
+                self.assertIn("`zstd` command is not on PATH", err["detail"])
+
+        # retire cannot check the thread's attention, so it must not archive it.
+        self._run_cli("retire", tid, env=no_zstd)
+        self.assertFalse(self.server.threads[tid].get("archived"))
 
     def test_dispatch_unarchives_archived_thread_first(self) -> None:
         with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
