@@ -42,9 +42,14 @@ Hard boundaries to include in every worker's prompt:
 - If a host has memory limits, state explicitly which checks run locally
   (e.g., `py_compile`, `ruff`, lightweight unit tests) vs on remote workers.
 
-`codex_app_ctl.py launch-batch` automatically validates that no two writer slots
-claim the same `worktree` or `output_dir` and writes a `FLEET-REGISTRY.json`
-manifest used by subsequent `status` checks.
+`codex_app_ctl.py launch-batch` validates the spec before any RPC call. It
+rejects two writer slots with the same write root (the `worktree`, or `cwd` when
+there is no worktree), a `branch` claimed twice, equal or nested `output_dir`s,
+repeated slot numbers, and more than one `cluster_write_owner`. Nested writer
+worktrees, writers without a worktree, and `danger-full-access` / `never`
+policies are allowed but reported as warnings. A successful launch writes a
+`FLEET-REGISTRY.json` manifest (including `validation_warnings`) used by
+subsequent `status` checks.
 
 ## 3. The Turn-Yielding Protocol
 

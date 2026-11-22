@@ -85,7 +85,7 @@ Running 2–5 parallel Codex writers inside a single working tree almost guarant
 | **Slot N · Read-Only Analyst / Auditor** | No Git working tree writes (`read_only: true` / `sandbox: "read-only"`) + exclusive report directory | Mines verified local artifacts, runs error analysis, audits sibling branches, and drafts figures/tables. |
 
 > [!IMPORTANT]
-> **Pre-flight collision rejection:** Before making a single RPC call, `launch-batch` (and `launch-batch --dry-run`) canonicalizes every slot's `worktree` and `output_dir` path and aborts immediately if two writer slots collide on the same directory. Every successfully launched fleet is tracked in a single `FLEET-REGISTRY.json` manifest for O(1) fleet-wide status sweeps.
+> **Pre-flight collision rejection:** Before making a single RPC call, `launch-batch` (and `launch-batch --dry-run`) canonicalizes every slot's paths and aborts if two writer slots share a write root (their `worktree`, or `cwd` when there is none), a `branch` is claimed twice, `output_dir`s are equal or nested, slot numbers repeat, or more than one slot is `cluster_write_owner`. Nested writer worktrees, worktree-less writers, and `danger-full-access` / `never` policies are allowed but listed as `warnings`. Validation errors are returned as a JSON object (exit code 1), never a traceback. Every successfully launched fleet is tracked in a single `FLEET-REGISTRY.json` manifest for O(1) fleet-wide status sweeps.
 
 ---
 
