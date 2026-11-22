@@ -274,6 +274,31 @@ def rollout_caption(
     }
 
 
+_MODEL_ID_RE = re.compile(r"^(?P<prefix>.+?)-(?P<version>\d+(?:\.\d+)*)-(?P<family>[a-z][a-z0-9]*)$")
+
+
+def _parse_model_id(model_id: Any) -> tuple[str, tuple[int, ...], str] | None:
+    """Split ids like `gpt-6.2-sol` into ("gpt", (6, 2), "sol"); None for other shapes."""
+    m = _MODEL_ID_RE.match(model_id) if isinstance(model_id, str) else None
+    if not m:
+        return None
+    return m["prefix"], tuple(int(x) for x in m["version"].split(".")), m["family"]
+
+
+def newest_in_family(model_ids: list[str], reference: str | None) -> str | None:
+    """Newest id sharing `reference`'s prefix and family suffix (e.g. the latest `gpt-*-sol`)."""
+    ref = _parse_model_id(reference)
+    if not ref:
+        return None
+    best: tuple[tuple[int, ...], str] | None = None
+    for mid in model_ids:
+        parsed = _parse_model_id(mid)
+        if parsed and parsed[0] == ref[0] and parsed[2] == ref[2]:
+            if best is None or parsed[1] > best[0]:
+                best = (parsed[1], mid)
+    return best[1] if best else None
+
+
 class CodexRPCError(RuntimeError):
     """Structured error returned by a Codex app-server JSON-RPC call."""
 
@@ -729,6 +754,54 @@ class CodexAppServerClient:
     def read_rate_limits(self) -> dict[str, Any]:
         return self.rpc("account/rateLimits/read", {})
 
+    def list_models(self, *, include_hidden: bool = False) -> list[dict[str, Any]]:
+        models: list[dict[str, Any]] = []
+        cursor = None
+        for _ in range(20):
+            params: dict[str, Any] = {"includeHidden": include_hidden}
+            if cursor:
+                params["cursor"] = cursor
+            res = self.rpc("model/list", params)
+            models.extend(m for m in (res.get("data") or []) if isinstance(m, dict))
+            cursor = res.get("nextCursor")
+            if not cursor:
+                break
+        return models
+
+    def model_freshness(self, configured: str | None) -> dict[str, Any]:
+        """Compare the configured default model with the newest visible model of its family.
+
+        Model ids look like `<prefix>-<version>-<family>` (`gpt-6.2-sol`), so the
+        newest family member is the highest version with the same prefix and suffix.
+        """
+        try:
+            models = self.list_models()
+        except CodexRPCError as exc:
+            return {"configured": configured, "error": exc.rpc_message}
+        ids = [str(m.get("id") or m.get("model")) for m in models if m.get("id") or m.get("model")]
+        newest = newest_in_family(ids, configured)
+        info: dict[str, Any] = {
+            "configured": configured,
+            "newestInFamily": newest,
+            "configuredIsNewest": (newest == configured) if newest else None,
+            "available": ids,
+            "warnings": [],
+        }
+        for m in models:
+            if (m.get("id") or m.get("model")) == configured:
+                efforts = m.get("supportedReasoningEfforts") or []
+                info["supportedEfforts"] = [
+                    e.get("reasoningEffort") if isinstance(e, dict) else e for e in efforts
+                ]
+        if configured and ids and configured not in ids:
+            info["warnings"].append(f"Configured model {configured!r} is not offered by this app-server.")
+        if newest and newest != configured:
+            info["warnings"].append(
+                f"A newer {_parse_model_id(newest)[2]} model is available: {newest} (configured: {configured}). "
+                "Update `model` in ~/.codex/config.toml so new sessions use it."
+            )
+        return info
+
     def list_loaded_threads(self) -> list[str]:
         res = self.rpc("thread/loaded/list", {})
         data = res.get("data")
@@ -742,6 +815,7 @@ class CodexAppServerClient:
         except CodexRPCError as exc:
             rate_limits = {"error": exc.rpc_message}
         loaded = self.list_loaded_threads()
+        models = self.model_freshness(cfg.get("model"))
 
         ordinary_allowed = rate_limits.get("ordinaryUsageAllowed")
         rl_obj = rate_limits.get("rateLimits") if isinstance(rate_limits, dict) else None
@@ -758,6 +832,7 @@ class CodexAppServerClient:
                 "approvalsReviewer": cfg.get("approvals_reviewer"),
                 "sandboxMode": cfg.get("sandbox_mode"),
             },
+            "models": models,
             "quota": {
                 "ordinaryUsageAllowed": ordinary_allowed,
                 "usedPercent": primary.get("usedPercent") if isinstance(primary, dict) else None,
