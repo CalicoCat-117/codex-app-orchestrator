@@ -820,6 +820,139 @@ class TestCodexAppCtl(unittest.TestCase):
         ]
         self.assertEqual(ctl.inspect_rollout_file(write_rollout("r5.jsonl", old))["last_turn_status"], "inProgress")
 
+    def _finish_turn(self, tid: str, text: str, status: str = "completed") -> None:
+        turn = self.server.turns[tid][-1]
+        turn["status"] = status
+        turn["items"].append({"type": "agentMessage", "text": text})
+        self.server.threads[tid]["status"] = {"type": "idle"}
+
+    def test_attention_classification(self) -> None:
+        idle = {"type": "idle"}
+        block = (
+            "Finished the sweep and wrote results.\n\n"
+            "[DECISION-NEEDED: tier=scientific]\n"
+            "Question: Use the external cohort for validation?\n"
+            "Options: A) external cohort | B) held-out internal split\n"
+            "Recommended: B - no new data access needed"
+        )
+        att = ctl.classify_attention(idle, "completed", block)
+        self.assertEqual(att["kind"], "decision_needed")
+        self.assertEqual(att["tier"], "scientific")
+        self.assertEqual(att["question"], "Use the external cohort for validation?")
+        self.assertTrue(att["recommended"].startswith("B"))
+
+        for text in (
+            "All tests pass. Should I proceed with the migration?",
+            "补丁已就绪。要我继续提交吗",
+            "建议下一步由 Zehao 复核读取事件，再决定是否重新授权。",
+            "Two candidate fixes are ready.\nWhich one do you prefer?",
+        ):
+            with self.subTest(text=text):
+                got = ctl.classify_attention(idle, "completed", text)
+                self.assertEqual((got or {}).get("kind"), "question", text)
+                self.assertTrue(got["heuristic"])
+
+        # Plain reports, running turns, and questions quoted mid-report are not flagged.
+        self.assertIsNone(ctl.classify_attention(idle, "completed", "Fixed the bug; 16 tests pass."))
+        quoted = "Q: should I proceed? was the old prompt.\nNow fixed.\nAll 16 tests pass.\nCommitted abc123."
+        self.assertIsNone(ctl.classify_attention(idle, "completed", quoted))
+        self.assertIsNone(ctl.classify_attention({"type": "active", "activeFlags": []}, "inProgress", block))
+
+        flags = {"type": "active", "activeFlags": ["waitingOnUserInput"]}
+        self.assertEqual(ctl.classify_attention(flags, "inProgress", None)["kind"], "waiting_on_user_input")
+        appr = {"type": "active", "activeFlags": ["waitingOnApproval"]}
+        self.assertEqual(ctl.classify_attention(appr, "inProgress", None)["kind"], "waiting_on_approval")
+
+    def test_status_attention_and_filter(self) -> None:
+        with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
+            asking = cli.start_thread(name="Asking", cwd=str(self.tmp_path), prompt="Go")["id"]
+            quiet = cli.start_thread(name="Quiet", cwd=str(self.tmp_path), prompt="Go")["id"]
+            blocked = cli.start_thread(name="Blocked", cwd=str(self.tmp_path), prompt="Go")["id"]
+        self._finish_turn(asking, "Done.\n[DECISION-NEEDED]\nQuestion: Delete the stale cache?\nOptions: A) yes | B) no\nRecommended: B - irreversible")
+        self._finish_turn(quiet, "Done. Report written to out/report.md.")
+
+        rollout = self.tmp_path / "rollout-blocked.jsonl"
+        call = {"type": "response_item", "payload": {"type": "function_call", "name": "request_user_input",
+                "arguments": json.dumps({"questions": [{"id": "q1", "question": "Which dataset?"}]})}}
+        rollout.write_text(json.dumps(call) + "\n", encoding="utf-8")
+        self.server.threads[blocked]["path"] = str(rollout)
+        self.server.threads[blocked]["status"] = {"type": "active", "activeFlags": ["waitingOnUserInput"]}
+
+        proc = self._run_cli("status", asking, quiet, blocked, "--attention-only")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = {r["id"]: r for r in map(json.loads, proc.stdout.strip().splitlines())}
+        self.assertEqual(set(rows), {asking, blocked})
+        self.assertEqual(rows[asking]["attention"]["question"], "Delete the stale cache?")
+        self.assertEqual(rows[blocked]["attention"]["questions"][0]["question"], "Which dataset?")
+        quiet_row = json.loads(self._run_cli("status", quiet).stdout)
+        self.assertIsNone(quiet_row["attention"])
+
+    def test_dispatch_interrupts_turn_waiting_on_user_input(self) -> None:
+        with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
+            created = cli.start_thread(name="Waiting", cwd=str(self.tmp_path), prompt="Go")
+            tid, first = created["id"], created["turn_id"]
+            self.server.threads[tid]["status"] = {"type": "active", "activeFlags": ["waitingOnUserInput"]}
+
+            skipped = cli.dispatch(tid, "Use dataset A.", steer_only=True)
+            self.assertEqual((skipped["mode"], skipped["reason"]), ("skipped", "waiting_on_user_input"))
+
+            res = cli.dispatch(tid, "Use dataset A.")
+            self.assertEqual(res["mode"], "interrupt+turn/start")
+            self.assertEqual(res["interruptedTurnId"], first)
+            self.assertEqual(self.server.turns[tid][0]["status"], "interrupted")
+            new_turn = self.server.turns[tid][-1]
+            self.assertEqual(new_turn["id"], res["turnId"])
+            text = new_turn["items"][0]["content"][0]["text"]
+            self.assertTrue(text.startswith("Your previous turn was interrupted"))
+            self.assertTrue(text.endswith("Use dataset A."))
+            self.assertNotIn("turn/steer", [m for m, _ in self.server.calls])
+
+    def test_watch_returns_on_attention_turn_end_and_timeout(self) -> None:
+        def make_client():
+            return ctl.CodexAppServerClient(str(self.sock_path))
+
+        with make_client() as cli:
+            a = cli.start_thread(name="A", cwd=str(self.tmp_path), prompt="Go")["id"]
+            b = cli.start_thread(name="B", cwd=str(self.tmp_path), prompt="Go")["id"]
+
+        clock = {"t": 0.0}
+        steps: list = []
+
+        def fake_sleep(sec: float) -> None:
+            clock["t"] += sec
+            if steps:
+                steps.pop(0)()
+
+        def run(**kw):
+            return ctl.watch_threads(make_client, [a, b], interval=10, sleep=fake_sleep, clock=lambda: clock["t"], **kw)
+
+        # 1. A running turn that ends: turn_finished on the poll after it ends.
+        steps[:] = [lambda: None, lambda: self._finish_turn(b, "Done; results in out/.")]
+        r1 = run()
+        self.assertFalse(r1["timedOut"])
+        self.assertEqual([(e["type"], e["id"]) for e in r1["events"]], [("turn_finished", b)])
+        self.assertEqual(r1["polls"], 3)
+
+        # 2. Existing attention returns at once; --ignore-current waits for something new.
+        self._finish_turn(a, "Ready.\nShould I proceed with the deploy?")
+        r2 = run()
+        self.assertEqual((r2["polls"], r2["events"][0]["type"], r2["events"][0]["id"]), (1, "attention", a))
+        with make_client() as cli:
+            cli.dispatch(b, "Next round")
+        steps[:] = [lambda: self._finish_turn(b, "Next round done.\n[DECISION-NEEDED]\nQuestion: Ship it?")]
+        r3 = run(ignore_current=True)
+        self.assertEqual([(e["type"], e["id"]) for e in r3["events"]], [("attention", b)])
+        self.assertEqual(r3["events"][0]["attention"]["kind"], "decision_needed")
+
+        # 3. Nothing new before max_wait: timed out (CLI exit 4).
+        steps[:] = []
+        r4 = run(ignore_current=True, max_wait=25)
+        self.assertTrue(r4["timedOut"])
+        self.assertEqual(r4["polls"], 4)
+        proc = self._run_cli("watch", a, "--ignore-current", "--max-wait", "0")
+        self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
+        self.assertTrue(json.loads(proc.stdout)["timedOut"])
+
     def test_global_flags_before_after_and_mixed_with_subcommands(self) -> None:
         # 1. Trailing global flags after subcommand (matches SKILL.md / README.md examples)
         proc_after = subprocess.run(
@@ -906,15 +1039,29 @@ class TestCodexAppCtl(unittest.TestCase):
 
         start_calls = [p for m, p in self.server.calls if m == "thread/start"]
         self.assertIn("Caption:", start_calls[0]["developerInstructions"])
+        self.assertIn("[DECISION-NEEDED]", start_calls[0]["developerInstructions"])
         self.assertIn("Focus on numerical stability.", start_calls[1]["developerInstructions"])
         self.assertIn("Caption:", start_calls[1]["developerInstructions"])
-        self.assertNotIn("developerInstructions", start_calls[2])
+        # Caption opt-out keeps the autonomy guard.
+        self.assertNotIn("Caption:", start_calls[2]["developerInstructions"])
+        self.assertIn("[DECISION-NEEDED]", start_calls[2]["developerInstructions"])
 
-        # CLI `--no-caption-guide` flag disables injection
+        # CLI `--no-caption-guide` drops only the caption guide; both flags drop everything.
         proc = self._run_cli("create", "--name", "CLI Opt-Out", "--cwd", str(self.tmp_path), "--no-caption-guide")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         last_start = [p for m, p in self.server.calls if m == "thread/start"][-1]
-        self.assertNotIn("developerInstructions", last_start)
+        self.assertNotIn("Caption:", last_start["developerInstructions"])
+        proc = self._run_cli(
+            "create", "--name", "CLI Bare", "--cwd", str(self.tmp_path), "--no-caption-guide", "--no-autonomy-guard"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("developerInstructions", [p for m, p in self.server.calls if m == "thread/start"][-1])
+
+        # A caller's own [DECISION-NEEDED...] contract (tri-autoresearch's tiered one) is not duplicated.
+        tri = "Contract...\n[DECISION-NEEDED: tier=engineering|scientific|redline]\nQuestion: ..."
+        composed = ctl.compose_developer_instructions(tri)
+        self.assertEqual(composed.count("[DECISION-NEEDED"), 1)
+        self.assertIn("Caption:", composed)
 
     def test_caption_extraction_and_cli_rendering(self) -> None:
         # 1. Explicit Caption section extraction + emoji cleanup + stop at next heading

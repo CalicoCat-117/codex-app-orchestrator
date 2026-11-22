@@ -43,6 +43,9 @@ installation is required.
        mid-turn injection; falls back to `turn/start` if the turn finishes mid-race)
      - `notLoaded` thread → **`thread/resume`** then **`turn/start`**
      - `idle` thread → **`turn/start`** with explicit policy/sandbox/model overrides
+     - turn blocked on `request_user_input` (`activeFlags: ["waitingOnUserInput"]`)
+       → **`turn/interrupt`** then **`turn/start`** with the answer, because a steer
+       cannot answer the pending tool call
    - Instruct every executor to follow the **Turn-Yielding Protocol** (launch
      async jobs or timers, record state, and end the turn immediately — never
      spin in a `sleep()` loop inside a turn).
@@ -61,7 +64,30 @@ installation is required.
    - Audit local receipts, git commits, and manifests before querying remote
      clusters or APIs; space any external/shared-server telemetry queries by
      at least 10 seconds (prefer 15–60s+ or milestone-aligned wakeups).
-6. **Return plain, principle-first session captions.**
+6. **Keep questions from stalling sessions.**
+   - Unattended Codex sessions rarely block on a protocol-level prompt; they
+     usually end a turn by handing a decision back, and the thread then sits
+     idle until someone replies.
+   - `create` and `launch-batch` attach an autonomy guard to
+     `developerInstructions` by default (disable with `--no-autonomy-guard` or
+     `"autonomy_guard": false`). It tells the executor to decide reversible
+     choices itself, ask only before irreversible, out-of-scope, unauthorized,
+     or goal-changing steps, finish independent work first, and ask through one
+     `[DECISION-NEEDED]` block. Instructions that already define such a block
+     keep their own wording.
+   - `status` reports `attention` per thread: `waiting_on_user_input`,
+     `waiting_on_approval`, `decision_needed` (with parsed `question`,
+     `options`, `recommended`), or `question` (heuristic: the turn ended on a
+     prose question). `status --attention-only` lists just those threads.
+   - Between check-ins, run `watch` in the background. It returns as soon as a
+     watched turn finishes or a thread needs attention, so the supervisor wakes
+     on the event instead of the next timer.
+   - Answer reversible engineering choices yourself with `dispatch`. Take
+     decisions about data access, irreversible actions, external publication,
+     scope or budget, and headline conclusions to the user.
+   - Do not run unattended executors in Codex Plan mode: `request_user_input`
+     is available there and blocks the turn.
+7. **Return plain, principle-first session captions.**
    - Keep session updates and handoffs easy to read and understated: explain the
      underlying mechanism, root cause, or design rationale (*why* a change works
      or failed) alongside concrete observed outcomes (files, commits, metrics,
@@ -159,7 +185,8 @@ python3 scripts/codex_app_ctl.py dispatch \
 ```
 
 Use `--steer-only` when an instruction should only inject into a currently
-running turn and be skipped if the thread already finished. Use `--queue-only`
+running turn and be skipped if the thread already finished (or is blocked on
+`request_user_input`, which a steer cannot answer). Use `--queue-only`
 only when you intentionally want `codex queue --resume` deferred delivery.
 
 ### 4. Interrupt or Retire Sessions
@@ -185,8 +212,21 @@ When running continuous multi-round research or engineering:
    or scheduler status alone.
 3. Synthesize findings, decide the next round's directions, write concise
    directive files, and call `dispatch` for each slot that needs new work or
-   mid-turn steering.
-4. If `health` / `--check-quota` returns exit code `3` (`quota_exhausted`),
+   mid-turn steering. Answer every thread with `attention` set (see rule 6),
+   escalating the decisions that belong to the user.
+4. Between check-ins, keep a `watch` running in the background so a finished
+   turn or a new question wakes you immediately (exit `0` with `events`; exit
+   `4` when `--max-wait` passes with nothing new):
+
+   ```bash
+   python3 scripts/codex_app_ctl.py watch \
+     --registry /abs/path/to/FLEET-REGISTRY.json --interval 30 --max-wait 2700
+   ```
+
+   Add `--ignore-current` when you deliberately leave a thread waiting (for
+   example, its question is with the user) so the same attention does not
+   return the watch again.
+5. If `health` / `--check-quota` returns exit code `3` (`quota_exhausted`),
    follow the failover / handoff-back protocol in
    [references/fleet-and-supervision-patterns.md](./references/fleet-and-supervision-patterns.md).
 
@@ -195,6 +235,8 @@ When running continuous multi-round research or engineering:
 After creating or updating sessions, verify:
 
 - `health` reports `daemon.status == "running"` and `quota.ordinaryUsageAllowed == true`.
+- `status --attention-only` prints nothing, or every listed thread has been
+  answered or escalated to the user.
 - `health.models.configuredIsNewest` is not `false`. If it is, a newer model of the
   configured family exists; raise it with the user before launching more work.
 - `status --verify-policy` shows `rollout_turn_context.approval_policy == "on-request"`,

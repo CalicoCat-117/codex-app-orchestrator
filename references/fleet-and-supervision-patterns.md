@@ -72,6 +72,26 @@ Include this boilerplate in every executor's initial brief:
   it immediately and pivot before continuing.
 ```
 
+### Questions without stalls
+
+An executor that ends a turn on a question leaves its thread idle until
+someone answers. `create` / `launch-batch` attach an autonomy guard by default
+(see SKILL.md rule 6); if you write your own brief instead, keep its substance:
+decide reversible choices and record them, stop only before irreversible,
+out-of-scope, unauthorized, or goal-changing steps, finish independent work
+first, and ask through exactly one block:
+
+```markdown
+[DECISION-NEEDED]
+Question: <one sentence>
+Options: A) ... | B) ...
+Recommended: <option> - <one-sentence reason>
+```
+
+The supervisor finds these with `status --attention-only` (or is woken by
+`watch`) and replies with `dispatch`. A turn blocked on `request_user_input`
+is interrupted and restarted with the answer by `dispatch` itself.
+
 ## 4. Periodic Supervision Loop
 
 When running continuous autonomous cycles:
@@ -85,6 +105,9 @@ When running continuous autonomous cycles:
      receipts, manifests, and markdown summaries.
    - Claim completion **only** from emitted verified artifacts/receipts — never
      solely from a thread returning `idle` or a scheduler reporting `SUCCEEDED`.
+   - Answer or escalate every thread that `status` marks with `attention`.
+   - Between check-ins, run `codex_app_ctl.py watch --registry FLEET-REGISTRY.json`
+     in the background so a finished turn or new question wakes you at once.
 3. **Telemetry hygiene**:
    - Never poll shared GPUs, clusters, or control planes in tight loops.
    - Space any live remote telemetry checks by **>= 10 seconds minimum** (prefer

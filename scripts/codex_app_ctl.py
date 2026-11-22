@@ -4,7 +4,9 @@
 Orchestrates persistent, UI-visible Codex sessions via the local app-server
 daemon's Unix-domain WebSocket control socket. Supports fleet creation,
 non-blocking dispatch (`turn/steer` for active turns, `thread/resume` +
-`turn/start` for unloaded threads, `turn/start` for idle threads), Guardian
+`turn/start` for unloaded threads, `turn/start` for idle threads,
+`turn/interrupt` + `turn/start` for turns blocked on `request_user_input`),
+detection of threads waiting on a question or decision (`status`, `watch`), Guardian
 `auto_review` policy management, rollout policy verification, quota health
 checks, and lifecycle teardown.
 """
@@ -42,6 +44,28 @@ DEFAULT_CAPTION_GUIDE = (
     "- Avoid decorative emojis, hype phrasing, and repetitive compliance or gatekeeping checklists."
 )
 
+# Attached to new sessions by default so executors decide reversible choices
+# themselves and ask only through one parseable block (see classify_attention).
+DEFAULT_AUTONOMY_GUARD = (
+    "Questions in supervised autonomous work:\n"
+    "1. Inside the task's stated scope and budget, do not stop to ask for confirmation on reversible "
+    "choices (parameters, tools, debugging approach, script fixes, naming, comparison baselines). Pick the "
+    "most conservative reasonable option, record it and the main alternative you rejected in your report, "
+    "and keep going.\n"
+    "2. Stop to ask only when the next step would be irreversible or destructive (deleting data, "
+    "force-pushing, publishing or sending anything externally), go beyond the stated scope, budget, or "
+    "compute limits, use data or credentials not already authorized, or change a frozen goal or headline "
+    "conclusion.\n"
+    "3. Before stopping, finish all work that does not depend on the answer and release idle resources. "
+    "Then end the turn with exactly one block:\n"
+    "[DECISION-NEEDED]\n"
+    "Question: <one sentence>\n"
+    "Options: A) ... | B) ...\n"
+    "Recommended: <option> - <one-sentence reason>\n"
+    "4. Do not call request_user_input, and do not end a turn on an open question in prose (for example "
+    "\"Should I proceed?\"). Ask only through the block above."
+)
+
 _CAPTION_HEADING_RE = re.compile(
     r"(?im)^[ \t]*(?:"
     r"#{1,6}[ \t]+(?:\*\*)?caption(?:\*\*)?[ \t]*(?:[:：](?:\*\*)?[ \t]*(.*))?"
@@ -58,16 +82,125 @@ def compose_developer_instructions(
     developer_instructions: str | None,
     *,
     caption_guide: bool = True,
+    autonomy_guard: bool = True,
 ) -> str | None:
-    """Attach the lightweight plain-caption guide unless explicitly disabled."""
+    """Attach the autonomy guard and plain-caption guide unless disabled or already present.
+
+    Instructions that already define a `[DECISION-NEEDED...]` block (for example
+    tri-autoresearch's tiered guard) keep their own wording.
+    """
     base = (developer_instructions or "").strip()
-    if not caption_guide:
-        return base or None
-    if not base:
-        return DEFAULT_CAPTION_GUIDE
-    if "Caption:" in base and "underlying mechanism" in base:
-        return base
-    return f"{base}\n\n{DEFAULT_CAPTION_GUIDE}"
+    parts = [base] if base else []
+    if autonomy_guard and "[DECISION-NEEDED" not in base:
+        parts.append(DEFAULT_AUTONOMY_GUARD)
+    if caption_guide and not ("Caption:" in base and "underlying mechanism" in base):
+        parts.append(DEFAULT_CAPTION_GUIDE)
+    return "\n\n".join(parts) or None
+
+
+_DECISION_BLOCK_RE = re.compile(r"\[DECISION-NEEDED(?:\s*:\s*([^\]]*))?\]", re.IGNORECASE)
+_DECISION_FIELD_RE = re.compile(r"(?im)^[ \t>*-]*(question|options|recommended)[ \t]*[:：][ \t]*(.+)$")
+_PROSE_QUESTION_RE = re.compile(
+    r"(?:please\s+confirm|which\s+option|would\s+you\s+like\s+me\s+to|should\s+i\s+(?:proceed|continue|go\s+ahead)"
+    r"|shall\s+i\b|before\s+i\s+proceed|do\s+you\s+want\s+me\s+to"
+    r"|awaiting\s+(?:your|user|human)\s+(?:decision|approval|confirmation|input)"
+    r"|let\s+me\s+know\s+(?:which|whether|if\s+you)"
+    r"|请确认|请选择|是否继续|是否需要我|要我[^。\n]{0,24}吗|需要(?:你|您|用户|人工)[^。\n]{0,8}(?:决定|确认|选择)"
+    r"|等待(?:你|您|用户)?的?(?:确认|决定|批准)|由\s*[^\s，。,]{1,16}\s*(?:选择|决定|拍板|复核|确认))",
+    re.IGNORECASE,
+)
+
+
+def parse_decision_block(message: str | None) -> dict[str, Any] | None:
+    """Parse the last `[DECISION-NEEDED]` block in an assistant message."""
+    if not message:
+        return None
+    matches = list(_DECISION_BLOCK_RE.finditer(message))
+    if not matches:
+        return None
+    last = matches[-1]
+    block: dict[str, Any] = {"raw": message[last.start() :].strip()[:1500]}
+    qualifier = (last.group(1) or "").strip()
+    tier = re.search(r"tier\s*=\s*([A-Za-z_]+)", qualifier)
+    if tier:
+        block["tier"] = tier.group(1).lower()
+    for m in _DECISION_FIELD_RE.finditer(message[last.end() :]):
+        block.setdefault(m.group(1).lower(), m.group(2).strip())
+    return block
+
+
+def _ends_on_prose_question(message: str | None) -> bool:
+    """True when the closing lines of a message ask the reader something."""
+    if not message:
+        return False
+    lines = [ln.strip() for ln in message.strip().splitlines() if ln.strip()]
+    if not lines:
+        return False
+    tail = "\n".join(lines[-3:])[-600:]
+    return bool(_PROSE_QUESTION_RE.search(tail)) or lines[-1].rstrip("*_` ").endswith(("?", "？"))
+
+
+def classify_attention(
+    status_obj: Any,
+    last_turn_status: str | None,
+    last_message: str | None,
+    *,
+    pending_questions: list[Any] | None = None,
+) -> dict[str, Any] | None:
+    """Return why a thread is waiting on a supervisor, or None when it is not.
+
+    Kinds, strongest first: `waiting_on_user_input` / `waiting_on_approval`
+    (protocol-level, the turn cannot continue), `decision_needed` (turn ended on a
+    `[DECISION-NEEDED]` block), and `question` (turn ended on a prose question;
+    heuristic).
+    """
+    flags = status_obj.get("activeFlags") if isinstance(status_obj, dict) else None
+    flags = flags if isinstance(flags, list) else []
+    if "waitingOnUserInput" in flags:
+        return {"kind": "waiting_on_user_input", "questions": pending_questions or []}
+    if "waitingOnApproval" in flags:
+        return {"kind": "waiting_on_approval"}
+    if last_turn_status in (None, "inProgress"):
+        return None
+    block = parse_decision_block(last_message)
+    if block:
+        return {"kind": "decision_needed", **block}
+    if _ends_on_prose_question(last_message):
+        tail = (last_message or "").strip()[-400:]
+        return {"kind": "question", "heuristic": True, "tail": tail}
+    return None
+
+
+def pending_user_input_questions(rollout_path: str | None, tail_bytes: int = 65536) -> list[Any]:
+    """Questions from the newest `request_user_input` call in a rollout's tail, if any."""
+    if not rollout_path:
+        return []
+    p = Path(rollout_path)
+    try:
+        size = p.stat().st_size
+        with p.open("rb") as fh:
+            if size > tail_bytes:
+                fh.seek(size - tail_bytes)
+            raw = fh.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return []
+    for line in reversed(raw.splitlines()):
+        if "request_user_input" not in line:
+            continue
+        try:
+            payload = json.loads(line).get("payload") or {}
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        if payload.get("name") != "request_user_input":
+            continue
+        args = payload.get("arguments")
+        try:
+            args = json.loads(args) if isinstance(args, str) else args
+        except json.JSONDecodeError:
+            return [args]
+        questions = args.get("questions") if isinstance(args, dict) else None
+        return questions if isinstance(questions, list) else [args]
+    return []
 
 
 def _clean_caption_lines(text: str) -> str:
@@ -948,8 +1081,17 @@ class CodexAppServerClient:
             "updatedAt": th.get("updatedAt"),
             "path": th.get("path"),
         }
+        msg = _extract_agent_message_from_turn(lt)
+        flags = status_obj.get("activeFlags") if isinstance(status_obj, dict) else None
+        pending = (
+            pending_user_input_questions(th.get("path"))
+            if isinstance(flags, list) and "waitingOnUserInput" in flags
+            else None
+        )
+        out["attention"] = classify_attention(
+            status_obj, out["last_turn_status"], msg, pending_questions=pending
+        )
         if include_last_message:
-            msg = _extract_agent_message_from_turn(lt)
             if msg is not None:
                 out["last_agent_message"] = msg[:1000]
         if verify_policy and th.get("path"):
@@ -1032,6 +1174,7 @@ class CodexAppServerClient:
         network_access: bool = False,
         developer_instructions: str | None = None,
         caption_guide: bool = True,
+        autonomy_guard: bool = True,
         ephemeral: bool = False,
     ) -> dict[str, Any]:
         """Create a persistent, Codex App-visible thread and optionally start Turn 1."""
@@ -1053,6 +1196,7 @@ class CodexAppServerClient:
         effective_dev_instructions = compose_developer_instructions(
             developer_instructions,
             caption_guide=caption_guide,
+            autonomy_guard=autonomy_guard,
         )
         if effective_dev_instructions:
             start_params["developerInstructions"] = effective_dev_instructions
@@ -1161,7 +1305,8 @@ class CodexAppServerClient:
         queue_only: bool = False,
         check_quota: bool = False,
     ) -> dict[str, Any]:
-        """Non-blocking dispatch: `turn/steer` if active, `thread/resume` + `turn/start` if unloaded, `turn/start` if idle."""
+        """Route a message by live state: steer an active turn, resume + start an unloaded thread,
+        start a turn on an idle one, and interrupt + restart a turn blocked on request_user_input."""
         if check_quota:
             self.check_quota_or_raise()
 
@@ -1207,6 +1352,32 @@ class CodexAppServerClient:
             th = self.read_thread(tid, include_turns=False)
 
         lt = self.latest_turn(tid)
+        live_flags = (th.get("status") or {}).get("activeFlags") if isinstance(th.get("status"), dict) else None
+        waiting_on_input = (
+            isinstance(live_flags, list)
+            and "waitingOnUserInput" in live_flags
+            and bool(lt and lt.get("status") == "inProgress" and lt.get("id"))
+        )
+        interrupted_turn_id = None
+        if waiting_on_input:
+            # A steer lands in the turn, but the pending request_user_input call still
+            # waits for its own response, so the turn stays blocked. Interrupt it and
+            # deliver the answer as a fresh turn (the thread history keeps the context).
+            if steer_only:
+                return {
+                    "mode": "skipped",
+                    "reason": "waiting_on_user_input",
+                    "threadId": tid,
+                    "status": th.get("status"),
+                }
+            interrupted_turn_id = lt["id"]
+            self.interrupt_turn(tid, interrupted_turn_id)
+            lt = self._wait_turn_settled(tid, interrupted_turn_id)
+            message = (
+                "Your previous turn was interrupted while it waited on request_user_input. "
+                "Supervisor answer:\n" + message
+            )
+
         if lt and lt.get("status") == "inProgress" and lt.get("id"):
             expected_turn_id = lt["id"]
             try:
@@ -1260,12 +1431,26 @@ class CodexAppServerClient:
             turn_params["effort"] = effort
 
         res = self.rpc("turn/start", turn_params)
-        return {
-            "mode": "turn/start",
+        out = {
+            "mode": "interrupt+turn/start" if interrupted_turn_id else "turn/start",
             "resumedFromNotLoaded": resumed,
             "threadId": tid,
             "turnId": (res.get("turn") or {}).get("id"),
         }
+        if interrupted_turn_id:
+            out["interruptedTurnId"] = interrupted_turn_id
+        return out
+
+    def _wait_turn_settled(self, tid: str, turn_id: str, timeout_s: float = 15.0) -> dict[str, Any] | None:
+        """Poll until `turn_id` is no longer in progress after an interrupt (bounded)."""
+        deadline = time.monotonic() + timeout_s
+        lt = self.latest_turn(tid)
+        while lt and lt.get("id") == turn_id and lt.get("status") == "inProgress":
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Turn {turn_id} was still in progress {timeout_s:.0f}s after turn/interrupt.")
+            time.sleep(0.5)
+            lt = self.latest_turn(tid)
+        return lt
 
     def interrupt_turn(self, tid: str, turn_id: str | None = None) -> dict[str, Any]:
         target_turn_id = turn_id
@@ -1298,6 +1483,77 @@ class CodexAppServerClient:
     def delete_thread(self, tid: str) -> dict[str, Any]:
         res = self.rpc("thread/delete", {"threadId": tid})
         return {"threadId": tid, "deleted": True, "result": res}
+
+
+EXIT_WATCH_TIMEOUT = 4
+
+
+def _watch_summary(st: dict[str, Any]) -> dict[str, Any]:
+    return {
+        k: st.get(k)
+        for k in ("id", "name", "status_type", "last_turn_id", "last_turn_status", "attention")
+    }
+
+
+def watch_threads(
+    make_client: Any,
+    ids: list[str],
+    *,
+    interval: float = 15.0,
+    max_wait: float = 3600.0,
+    ignore_current: bool = False,
+    sleep: Any = time.sleep,
+    clock: Any = time.monotonic,
+) -> dict[str, Any]:
+    """Poll threads until one finishes a turn or needs attention, or `max_wait` passes.
+
+    Each poll opens a fresh connection, so a long watch does not depend on one
+    idle socket staying open. Events:
+    - `attention`: the thread waits on a question, approval, or decision
+      (see classify_attention). Existing attention counts unless `ignore_current`.
+    - `turn_finished`: a turn that was running (or a new turn) reached a final state.
+    """
+    def poll() -> dict[str, dict[str, Any]]:
+        with make_client() as cli:
+            return {tid: cli.thread_status(tid) for tid in ids}
+
+    start = clock()
+    prev = poll()
+    polls = 1
+    events: list[dict[str, Any]] = []
+    if not ignore_current:
+        events = [{"type": "attention", **_watch_summary(st)} for st in prev.values() if st.get("attention")]
+
+    while not events:
+        remaining = max_wait - (clock() - start)
+        if remaining <= 0:
+            return {
+                "timedOut": True,
+                "events": [],
+                "polls": polls,
+                "threads": [_watch_summary(st) for st in prev.values()],
+            }
+        sleep(min(interval, remaining))
+        cur = poll()
+        polls += 1
+        for tid, st in cur.items():
+            before = prev.get(tid) or {}
+            att, att_before = st.get("attention"), before.get("attention")
+            new_turn = st.get("last_turn_id") != before.get("last_turn_id")
+            if att and (not att_before or new_turn or att.get("kind") != att_before.get("kind")):
+                events.append({"type": "attention", **_watch_summary(st)})
+            elif st.get("last_turn_status") not in (None, "inProgress") and (
+                before.get("last_turn_status") == "inProgress" or new_turn
+            ):
+                events.append({"type": "turn_finished", **_watch_summary(st)})
+        prev = cur
+
+    return {
+        "timedOut": False,
+        "events": events,
+        "polls": polls,
+        "threads": [_watch_summary(st) for st in prev.values()],
+    }
 
 
 def _fleet_path(value: str) -> Path:
@@ -1416,6 +1672,7 @@ def validate_fleet_spec(
         item["approval_policy"] = approval_policy
         item["approvals_reviewer"] = reviewer
         item["caption_guide"] = bool(raw.get("caption_guide", True))
+        item["autonomy_guard"] = bool(raw.get("autonomy_guard", True))
         normalized.append(item)
 
     if len(cluster_owners) > 1:
@@ -1594,6 +1851,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include a preview of the latest assistant message.",
     )
+    s_status.add_argument(
+        "--attention-only",
+        action="store_true",
+        help="Only print threads whose `attention` is set (waiting on a question, approval, or decision).",
+    )
+
+    # watch
+    s_watch = sub.add_parser(
+        "watch",
+        parents=[sub_common],
+        help="Block until a watched thread finishes a turn or needs attention (exit 4 on timeout).",
+    )
+    s_watch.add_argument("ids", nargs="*", help="Thread UUID(s).")
+    s_watch.add_argument("--registry", default=None, help="Load thread IDs from a FLEET-REGISTRY.json file.")
+    s_watch.add_argument("--interval", type=float, default=15.0, help="Seconds between polls (minimum 1, default 15).")
+    s_watch.add_argument("--max-wait", type=float, default=3600.0, help="Give up after this many seconds (default 3600).")
+    s_watch.add_argument(
+        "--ignore-current",
+        action="store_true",
+        help="Do not return for attention that already exists at start; report only new events.",
+    )
 
     # create
     s_create = sub.add_parser(
@@ -1618,6 +1896,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not attach the default plain principle-first turn caption instruction.",
     )
+    s_create.add_argument(
+        "--no-autonomy-guard",
+        action="store_true",
+        help="Do not attach the default instruction to decide reversible choices and ask only via [DECISION-NEEDED].",
+    )
     s_create.add_argument("--ephemeral", action="store_true", help="Create an ephemeral thread (not persisted).")
     s_create.add_argument("--check-quota", action="store_true", help="Abort before creation if Codex quota is exhausted.")
 
@@ -1636,7 +1919,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_disp = sub.add_parser(
         "dispatch",
         parents=[sub_common],
-        help="Smart non-blocking dispatch (`turn/steer` if active, `thread/resume` + `turn/start` if unloaded, `turn/start` if idle).",
+        help="Smart non-blocking dispatch (`turn/steer` if active, `thread/resume` + `turn/start` if unloaded, `turn/start` if idle, interrupt + `turn/start` if blocked on request_user_input).",
     )
     s_disp.add_argument("--thread", required=True, help="Target thread UUID.")
     s_disp.add_argument("--message", default=None, help="Directive text (or '-' for stdin).")
@@ -1756,6 +2039,7 @@ def main(argv: list[str] | None = None) -> int:
                     "approvals_reviewer": item["approvals_reviewer"],
                     "sandbox": item["sandbox"],
                     "caption_guide": item["caption_guide"],
+                    "autonomy_guard": item["autonomy_guard"],
                     "has_prompt": item["resolved_prompt"] is not None,
                 }
                 for i, item in enumerate(validated)
@@ -1765,6 +2049,22 @@ def main(argv: list[str] | None = None) -> int:
                 pretty=args.pretty,
             )
             return 0
+
+        if args.cmd == "watch":
+            ids = list(args.ids)
+            if args.registry:
+                ids.extend(_load_ids_from_registry(args.registry))
+            if not ids:
+                parser.error("watch requires at least one thread ID or --registry.")
+            result = watch_threads(
+                lambda: CodexAppServerClient(sock_path=args.socket, timeout=args.timeout),
+                list(dict.fromkeys(ids)),
+                interval=max(1.0, args.interval),
+                max_wait=max(0.0, args.max_wait),
+                ignore_current=args.ignore_current,
+            )
+            _print_json(result, pretty=args.pretty)
+            return EXIT_WATCH_TIMEOUT if result["timedOut"] else 0
 
         with CodexAppServerClient(sock_path=args.socket, timeout=args.timeout) as cli:
             if args.cmd == "health":
@@ -1793,6 +2093,8 @@ def main(argv: list[str] | None = None) -> int:
                         verify_policy=args.verify_policy,
                         include_last_message=args.last_message,
                     )
+                    if args.attention_only and not res.get("attention"):
+                        continue
                     _print_json(res, pretty=args.pretty)
 
             elif args.cmd == "create":
@@ -1814,6 +2116,7 @@ def main(argv: list[str] | None = None) -> int:
                     network_access=args.network_access,
                     developer_instructions=args.developer_instructions,
                     caption_guide=not args.no_caption_guide,
+                    autonomy_guard=not args.no_autonomy_guard,
                     ephemeral=args.ephemeral,
                 )
                 _print_json(res, pretty=args.pretty)
@@ -1878,6 +2181,7 @@ def main(argv: list[str] | None = None) -> int:
                             network_access=bool(item.get("network_access", False)),
                             developer_instructions=item.get("developer_instructions"),
                             caption_guide=bool(item.get("caption_guide", True)),
+                            autonomy_guard=bool(item.get("autonomy_guard", True)),
                             ephemeral=bool(item.get("ephemeral", False)),
                         )
                         entry = {
