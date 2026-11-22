@@ -79,7 +79,7 @@ installation is required.
      `waiting_on_approval`, `decision_needed` (with parsed `question`,
      `options`, `recommended`), or `question` (heuristic: the turn ended on a
      prose question). `status --attention-only` lists just those threads.
-   - The turn summary of a `notLoaded` thread often leaves out the agent's
+   - The turn summary of a `notLoaded` thread can leave out the agent's
      closing message. `status` then reads the last assistant message from the
      thread's rollout, and `attention.message_source` says where the message
      came from (`turn` or `rollout`).

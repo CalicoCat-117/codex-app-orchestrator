@@ -1211,7 +1211,7 @@ class CodexAppServerClient:
         }
         msg = _extract_agent_message_from_turn(lt)
         msg_source = "turn" if msg is not None else None
-        # The turn summary often leaves out the agent message (notLoaded threads,
+        # The turn summary can leave out the agent message (notLoaded threads,
         # compaction turns). When a finished turn's attention or --last-message
         # needs it, take the last assistant text from the rollout instead.
         wants_msg = include_last_message or out["last_turn_status"] not in (None, "inProgress")
