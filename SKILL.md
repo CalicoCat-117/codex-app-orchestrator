@@ -80,9 +80,11 @@ installation is required.
      `options`, `recommended`), or `question` (heuristic: the turn ended on a
      prose question). `status --attention-only` lists just those threads.
    - The turn summary of a `notLoaded` thread can leave out the agent's
-     closing message. `status` then reads the last assistant message from the
-     thread's rollout, and `attention.message_source` says where the message
-     came from (`turn` or `rollout`).
+     closing message. For a completed turn, `status` then reads the last
+     assistant message from the thread's rollout, and
+     `attention.message_source` says where the message came from (`turn` or
+     `rollout`). Failed and interrupted turns are not read for attention; their
+     `last_turn_status` already calls for a look.
    - Between check-ins, run `watch` in the background. It returns as soon as a
      watched turn finishes or a thread needs attention, so the supervisor wakes
      on the event instead of the next timer.

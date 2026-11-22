@@ -1212,14 +1212,17 @@ class CodexAppServerClient:
         msg = _extract_agent_message_from_turn(lt)
         msg_source = "turn" if msg is not None else None
         # The turn summary can leave out the agent message (notLoaded threads,
-        # compaction turns). When a finished turn's attention or --last-message
-        # needs it, take the last assistant text from the rollout instead.
-        wants_msg = include_last_message or out["last_turn_status"] not in (None, "inProgress")
+        # compaction turns). For a completed turn, judge attention on the last
+        # assistant text in the rollout instead. Failed and interrupted turns are
+        # not read for attention: their status already asks for a look (retire
+        # skips them), and their rollouts can run to GBs.
+        completed = out["last_turn_status"] == "completed"
         rollout: dict[str, Any] | None = None
-        if th.get("path") and (verify_policy or (msg is None and wants_msg)):
+        if th.get("path") and (verify_policy or (msg is None and (completed or include_last_message))):
             rollout = inspect_rollout_file(th["path"], last_n=3, include_full_last_message=True)
-        if msg is None and wants_msg and rollout and rollout.get("last_assistant_text"):
-            msg, msg_source = rollout["last_assistant_text"], "rollout"
+        rollout_msg = rollout.get("last_assistant_text") if rollout else None
+        if msg is None and completed and rollout_msg:
+            msg, msg_source = rollout_msg, "rollout"
         flags = status_obj.get("activeFlags") if isinstance(status_obj, dict) else None
         pending = (
             pending_user_input_questions(th.get("path"))
@@ -1232,8 +1235,9 @@ class CodexAppServerClient:
         if attention and attention["kind"] in ("decision_needed", "question"):
             attention["message_source"] = msg_source
         out["attention"] = attention
-        if include_last_message and msg is not None:
-            out["last_agent_message"] = msg[:1000]
+        shown = msg if msg is not None else rollout_msg
+        if include_last_message and shown is not None:
+            out["last_agent_message"] = shown[:1000]
         if verify_policy and rollout is not None:
             out["rollout_turn_context"] = rollout.get("last_turn_context")
             out["rollout_recent_errors"] = rollout.get("recent_errors")

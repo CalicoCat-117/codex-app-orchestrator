@@ -1431,6 +1431,18 @@ class TestCodexAppCtl(unittest.TestCase):
         self.assertIsNone(rows["Summarised"]["attention"])
         self.assertEqual(rows["Summarised"]["last_agent_message"], "All done; nothing pending.")
 
+        # Failed and interrupted turns are not read for attention (retire skips them
+        # anyway), but --last-message still fetches their text from the rollout.
+        with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
+            stopped = cli.start_thread(name="Stopped", cwd=str(self.tmp_path), prompt="Go")["id"]
+        self._park_thread(stopped, self._write_rollout("stopped.jsonl", self._rollout_turn("t1", decision, end=None)))
+        self.server.turns[stopped][-1]["status"] = "interrupted"
+        plain_status = json.loads(self._run_cli("status", stopped).stdout)
+        self.assertEqual((plain_status["last_turn_status"], plain_status["attention"]), ("interrupted", None))
+        with_message = json.loads(self._run_cli("status", stopped, "--last-message").stdout)
+        self.assertTrue(with_message["last_agent_message"].startswith("Sweep finished."))
+        self.assertIsNone(with_message["attention"])  # --last-message only shows the text
+
         # retire keeps the threads that wait on a reply and archives the finished one.
         proc = self._run_cli("retire", *ids.values())
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
