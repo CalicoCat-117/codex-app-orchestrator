@@ -114,8 +114,14 @@ python3 scripts/codex_app_ctl.py launch-batch \
   --check-quota --pretty
 ```
 
-`launch-batch` rejects duplicate `worktree` or `output_dir` assignments across
-writer slots before making any RPC calls.
+Before any RPC call, `launch-batch` rejects a spec when two writer slots share a
+write root (their `worktree`, or `cwd` when a slot has no worktree), two slots
+claim the same `branch`, `output_dir`s are equal or nested, slot numbers repeat,
+or more than one slot is `cluster_write_owner`. Errors come back as a JSON object
+with exit code 1. Nested writer worktrees, writers without a worktree, and
+`danger-full-access` / `never` policies pass but are listed under `warnings`
+(the dry-run output and the registry's `validation_warnings`); read them before
+launching.
 
 ### 3. Monitor, Render Captions, Verify Policy, and Steer/Dispatch
 
@@ -131,6 +137,9 @@ python3 scripts/codex_app_ctl.py status \
 # Plain, principle-first session caption (supports thread IDs, --registry, or offline --path)
 python3 scripts/codex_app_ctl.py caption --registry /abs/path/to/FLEET-REGISTRY.json
 python3 scripts/codex_app_ctl.py caption <THREAD_UUID> --json --pretty
+
+# Raw rollout facts: effective turn_context, last turn state, recent errors
+python3 scripts/codex_app_ctl.py inspect-rollout --thread <THREAD_UUID> --pretty
 ```
 
 Deliver a new round directive or mid-turn correction without blocking:

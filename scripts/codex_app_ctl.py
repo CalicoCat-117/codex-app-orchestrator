@@ -161,6 +161,15 @@ def _summarize_policy(turn_ctx: dict[str, Any] | None) -> dict[str, Any] | None:
     return out if any(v is not None for v in out.values()) else None
 
 
+def _errors_for_turn(errors: list[dict[str, Any]] | None, turn_id: str | None) -> list[dict[str, Any]]:
+    """Keep only rollout errors from `turn_id`, so an earlier turn's abort is not reported as current."""
+    if not errors:
+        return []
+    if not turn_id:
+        return list(errors)
+    return [e for e in errors if not isinstance(e, dict) or e.get("turn_id") in (None, turn_id)]
+
+
 def _format_error_summary(last_turn_error: Any, recent_errors: list[dict[str, Any]] | None) -> str | None:
     if last_turn_error:
         if isinstance(last_turn_error, dict):
@@ -242,22 +251,24 @@ def rollout_caption(
     if not rollout.get("exists"):
         raise FileNotFoundError(f"Rollout file not found: {path}")
     ctx = rollout.get("last_turn_context") or {}
+    last_turn_id = rollout.get("last_turn_id") or ctx.get("turn_id")
     caption_text, source = extract_caption_text(rollout.get("last_assistant_text"), max_chars=max_chars)
     p = Path(path)
     return {
         "id": None,
         "slot": None,
         "name": name or p.stem,
-        "status_type": "completed" if rollout.get("task_complete_count", 0) > 0 else "recorded",
-        "last_turn_id": ctx.get("turn_id"),
-        "last_turn_status": "completed" if rollout.get("task_complete_count", 0) > 0 else None,
+        # Read from the file alone, so the live thread state is unknown.
+        "status_type": "offline",
+        "last_turn_id": last_turn_id,
+        "last_turn_status": rollout.get("last_turn_status"),
         "cwd": ctx.get("cwd"),
         "branch": None,
         "model": ctx.get("model"),
         "effort": ctx.get("effort"),
         "caption": caption_text,
         "caption_source": source,
-        "error": _format_error_summary(None, rollout.get("recent_errors")),
+        "error": _format_error_summary(None, _errors_for_turn(rollout.get("recent_errors"), last_turn_id)),
         "policy": _summarize_policy(ctx),
         "path": str(p),
     }
@@ -388,7 +399,9 @@ def inspect_rollout_file(
 
     Extracts the latest `turn_context` (ground-truth effective approval policy,
     approvals reviewer, sandbox policy, model, effort), recent assistant messages,
-    and any error/rate-limit events.
+    any error/rate-limit events (tagged with the turn they belong to), and the
+    id and terminal state of the most recent turn (`last_turn_status`:
+    `inProgress`, `completed`, `interrupted`, or `aborted`).
     """
     p = Path(path)
     if not p.exists():
@@ -399,6 +412,11 @@ def inspect_rollout_file(
     assistant_messages: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     task_completes = 0
+    # Follow the most recent turn in file order. A turn opens with `task_started`
+    # (newer rollouts) or its first `turn_context` (older ones) and closes with
+    # `task_complete` or `turn_aborted`; events without a turn_id apply to the open turn.
+    current_turn_id: str | None = None
+    current_turn_status: str | None = None
 
     with p.open("r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
@@ -414,6 +432,16 @@ def inspect_rollout_file(
             payload = obj.get("payload")
             if entry_type == "turn_context" and isinstance(payload, dict):
                 turn_context_count += 1
+                ctx_turn_id = payload.get("turn_id")
+                opens_new_turn = (
+                    current_turn_status is None
+                    or (ctx_turn_id and ctx_turn_id != current_turn_id)
+                    # Old rollouts without turn ids: a context after a closed turn starts the next one.
+                    or (not ctx_turn_id and current_turn_status != "inProgress")
+                )
+                if opens_new_turn:
+                    current_turn_id = ctx_turn_id
+                    current_turn_status = "inProgress"
                 last_turn_context = {
                     "turn_id": payload.get("turn_id"),
                     "model": payload.get("model"),
@@ -438,16 +466,28 @@ def inspect_rollout_file(
                         )
             elif entry_type == "event_msg" and isinstance(payload, dict):
                 ev_type = payload.get("type")
-                if ev_type == "task_complete":
+                ev_turn_id = payload.get("turn_id")
+                applies_to_current = ev_turn_id is None or ev_turn_id == current_turn_id
+                if ev_type == "task_started":
+                    current_turn_id = ev_turn_id
+                    current_turn_status = "inProgress"
+                elif ev_type == "task_complete":
                     task_completes += 1
-                elif ev_type in ("error", "turn_aborted", "warning"):
+                    if applies_to_current:
+                        current_turn_status = "completed"
+                if ev_type in ("error", "turn_aborted", "warning"):
                     errors.append(
                         {
                             "timestamp": obj.get("timestamp"),
                             "type": ev_type,
+                            "turn_id": ev_turn_id or current_turn_id,
                             "message": payload.get("message") or payload.get("reason") or payload,
                         }
                     )
+                    if ev_type == "turn_aborted" and applies_to_current:
+                        current_turn_status = (
+                            "interrupted" if payload.get("reason") == "interrupted" else "aborted"
+                        )
 
     trimmed_messages = [
         {
@@ -464,6 +504,8 @@ def inspect_rollout_file(
         "size_bytes": p.stat().st_size,
         "turn_context_count": turn_context_count,
         "task_complete_count": task_completes,
+        "last_turn_id": current_turn_id,
+        "last_turn_status": current_turn_status,
         "last_turn_context": last_turn_context,
         "recent_assistant_messages": trimmed_messages,
         "recent_errors": errors[-max(1, last_n) :],
@@ -881,12 +923,13 @@ class CodexAppServerClient:
 
         meta = registry_meta or {}
         ctx = rollout.get("last_turn_context") or {}
+        last_turn_id = lt.get("id") if isinstance(lt, dict) else ctx.get("turn_id")
         return {
             "id": th.get("id") or tid,
             "slot": meta.get("slot"),
             "name": th.get("name") or meta.get("name"),
             "status_type": status_type,
-            "last_turn_id": lt.get("id") if isinstance(lt, dict) else ctx.get("turn_id"),
+            "last_turn_id": last_turn_id,
             "last_turn_status": lt_status,
             "cwd": th.get("cwd") or meta.get("worktree") or meta.get("cwd") or ctx.get("cwd"),
             "branch": meta.get("branch"),
@@ -894,7 +937,7 @@ class CodexAppServerClient:
             "effort": th.get("reasoningEffort") or ctx.get("effort") or meta.get("effort"),
             "caption": caption_text,
             "caption_source": source,
-            "error": _format_error_summary(lt_error, rollout.get("recent_errors")),
+            "error": _format_error_summary(lt_error, _errors_for_turn(rollout.get("recent_errors"), last_turn_id)),
             "policy": _summarize_policy(ctx),
             "path": rpath,
         }
@@ -1182,19 +1225,48 @@ class CodexAppServerClient:
         return {"threadId": tid, "deleted": True, "result": res}
 
 
-def validate_fleet_spec(specs: list[dict[str, Any]], spec_dir: Path) -> list[dict[str, Any]]:
+def _fleet_path(value: str) -> Path:
+    return Path(value).expanduser().resolve()
+
+
+def _path_contains(outer: Path, inner: Path) -> bool:
+    """True when `inner` is `outer` itself or sits somewhere below it."""
+    return outer == inner or outer in inner.parents
+
+
+def validate_fleet_spec(
+    specs: list[dict[str, Any]],
+    spec_dir: Path,
+    warnings: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """Validate a multi-session fleet launch specification before touching the daemon.
 
-    Enforces isolation invariants:
-    - Each item must declare `name` and `cwd`.
-    - Distinct writer slots must not share the same `worktree` or `output_dir`.
+    Hard errors (raise ValueError / FileNotFoundError):
+    - Each item must declare `name` and `cwd`; slot numbers must be unique.
+    - Two writer slots must not write in the same directory. A writer's write
+      root is its `worktree`, or its `cwd` when it has no worktree, so two
+      worktree-less writers sharing one `cwd` are rejected.
+    - No two slots may claim the same `branch` (git refuses to check one branch
+      out in two worktrees, and two writers on one branch clobber each other).
+    - No two slots may share an `output_dir`, or nest one inside another.
+    - At most one slot may set `cluster_write_owner: true`.
     - `prompt_file` paths (if provided) must exist.
+
+    Soft findings are appended to `warnings` (when a list is passed):
+    - A writer's write root nested inside another writer's root (legitimate for
+      .gitignored in-repo worktrees, but the outer slot can reach the inner one).
+    - A writer slot without its own worktree in a fleet with several writers.
+    - `danger-full-access` sandbox or `never` approval policy.
     """
     if not isinstance(specs, list) or not specs:
         raise ValueError("Fleet spec must be a non-empty JSON array of session specs.")
 
-    seen_worktrees: dict[str, str] = {}
-    seen_outdirs: dict[str, str] = {}
+    found_warnings: list[str] = []
+    seen_slots: dict[Any, str] = {}
+    seen_branches: dict[str, str] = {}
+    cluster_owners: list[str] = []
+    writer_roots: list[tuple[str, Path, bool]] = []  # (name, write root, has_worktree)
+    out_dirs: list[tuple[str, Path]] = []
     normalized: list[dict[str, Any]] = []
 
     for idx, raw in enumerate(specs):
@@ -1216,27 +1288,40 @@ def validate_fleet_spec(specs: list[dict[str, Any]], spec_dir: Path) -> list[dic
         reviewer = raw.get("approvals_reviewer", "auto_review")
         if reviewer not in VALID_REVIEWERS:
             raise ValueError(f"Spec entry {name!r} has invalid approvals_reviewer {reviewer!r}.")
+        if sandbox == "danger-full-access":
+            found_warnings.append(
+                f"{name!r} uses sandbox 'danger-full-access'; only launch it if the user explicitly authorized that."
+            )
+        if approval_policy == "never":
+            found_warnings.append(
+                f"{name!r} uses approval_policy 'never'; only launch it if the user explicitly authorized that."
+            )
+
+        slot = raw.get("slot", idx + 1)
+        if slot in seen_slots:
+            raise ValueError(f"Duplicate slot {slot!r}: used by both {seen_slots[slot]!r} and {name!r}.")
+        seen_slots[slot] = name
+
+        branch = raw.get("branch")
+        if branch:
+            if branch in seen_branches:
+                raise ValueError(
+                    f"Branch isolation collision: {branch!r} assigned to both "
+                    f"{seen_branches[branch]!r} and {name!r}."
+                )
+            seen_branches[branch] = name
+
+        if raw.get("cluster_write_owner"):
+            cluster_owners.append(name)
 
         is_readonly = sandbox == "read-only" or bool(raw.get("read_only"))
-        wt = raw.get("worktree")
-        if wt and not is_readonly:
-            wt_norm = str(Path(wt).resolve())
-            if wt_norm in seen_worktrees:
-                raise ValueError(
-                    f"Worktree isolation collision: {wt_norm!r} assigned to both "
-                    f"{seen_worktrees[wt_norm]!r} and {name!r}."
-                )
-            seen_worktrees[wt_norm] = name
+        if not is_readonly:
+            wt = raw.get("worktree")
+            writer_roots.append((name, _fleet_path(wt or cwd), bool(wt)))
 
         out_dir = raw.get("output_dir")
         if out_dir:
-            out_norm = str(Path(out_dir).resolve())
-            if out_norm in seen_outdirs:
-                raise ValueError(
-                    f"Output directory isolation collision: {out_norm!r} assigned to both "
-                    f"{seen_outdirs[out_norm]!r} and {name!r}."
-                )
-            seen_outdirs[out_norm] = name
+            out_dirs.append((name, _fleet_path(out_dir)))
 
         prompt = raw.get("prompt")
         prompt_file = raw.get("prompt_file")
@@ -1258,6 +1343,50 @@ def validate_fleet_spec(specs: list[dict[str, Any]], spec_dir: Path) -> list[dic
         item["caption_guide"] = bool(raw.get("caption_guide", True))
         normalized.append(item)
 
+    if len(cluster_owners) > 1:
+        raise ValueError(
+            "At most one slot may set cluster_write_owner: true; found "
+            + ", ".join(repr(n) for n in cluster_owners) + "."
+        )
+
+    for i, (name_a, root_a, wt_a) in enumerate(writer_roots):
+        for name_b, root_b, wt_b in writer_roots[i + 1 :]:
+            if root_a == root_b:
+                kind = "Worktree" if (wt_a and wt_b) else "Writer"
+                raise ValueError(
+                    f"{kind} isolation collision: {str(root_a)!r} is the write root of both "
+                    f"{name_a!r} and {name_b!r}. Give each writer slot its own git worktree, "
+                    "or mark one read_only."
+                )
+            if _path_contains(root_a, root_b) or _path_contains(root_b, root_a):
+                outer, inner = (name_a, name_b) if _path_contains(root_a, root_b) else (name_b, name_a)
+                found_warnings.append(
+                    f"Write root of {inner!r} is nested inside the write root of {outer!r}; "
+                    f"make sure {outer!r} never edits the nested directory."
+                )
+
+    if len(writer_roots) > 1:
+        for name, _root, has_wt in writer_roots:
+            if not has_wt:
+                found_warnings.append(
+                    f"Writer slot {name!r} has no dedicated worktree and writes in its cwd."
+                )
+
+    for i, (name_a, out_a) in enumerate(out_dirs):
+        for name_b, out_b in out_dirs[i + 1 :]:
+            if out_a == out_b:
+                raise ValueError(
+                    f"Output directory isolation collision: {str(out_a)!r} assigned to both "
+                    f"{name_a!r} and {name_b!r}."
+                )
+            if _path_contains(out_a, out_b) or _path_contains(out_b, out_a):
+                raise ValueError(
+                    f"Output directory isolation collision: {name_a!r} ({str(out_a)!r}) and "
+                    f"{name_b!r} ({str(out_b)!r}) are nested; give each slot a sibling directory."
+                )
+
+    if warnings is not None:
+        warnings.extend(found_warnings)
     return normalized
 
 
@@ -1515,51 +1644,53 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # Offline path for inspect-rollout --path (no daemon required).
-    if args.cmd == "inspect-rollout" and args.path and not args.thread:
-        _print_json(inspect_rollout_file(args.path, last_n=args.last_n), pretty=args.pretty)
-        return 0
-
-    # Offline path for caption --path (no daemon required).
-    if args.cmd == "caption" and args.path and not args.ids and not args.registry:
-        try:
-            rec = rollout_caption(args.path, max_chars=args.max_chars)
-        except (FileNotFoundError, OSError, ValueError) as exc:
-            _print_json({"ok": False, "error": type(exc).__name__, "detail": str(exc)}, pretty=args.pretty)
-            return 1
-        if args.json:
-            _print_json(rec, pretty=args.pretty)
-        else:
-            print(format_session_caption(rec, show_policy=args.show_policy), flush=True)
-        return 0
-
-    if args.cmd == "launch-batch" and args.dry_run:
-        spec_path = Path(args.spec).resolve()
-        raw_specs = json.loads(spec_path.read_text(encoding="utf-8"))
-        validated = validate_fleet_spec(raw_specs, spec_path.parent)
-        summary = [
-            {
-                "slot": item.get("slot", i + 1),
-                "name": item["name"],
-                "existing_thread_id": item.get("existing_thread_id"),
-                "cwd": item["cwd"],
-                "worktree": item.get("worktree"),
-                "branch": item.get("branch"),
-                "output_dir": item.get("output_dir"),
-                "model": item.get("model"),
-                "effort": item.get("effort"),
-                "approval_policy": item["approval_policy"],
-                "approvals_reviewer": item["approvals_reviewer"],
-                "sandbox": item["sandbox"],
-                "caption_guide": item["caption_guide"],
-                "has_prompt": item["resolved_prompt"] is not None,
-            }
-            for i, item in enumerate(validated)
-        ]
-        _print_json({"dry_run": True, "count": len(summary), "sessions": summary}, pretty=args.pretty)
-        return 0
-
+    # Every command, including the offline and dry-run paths, reports failures as a
+    # JSON error object (exit 1, or 3 for quota exhaustion) instead of a traceback.
     try:
+        # Offline path for inspect-rollout --path (no daemon required).
+        if args.cmd == "inspect-rollout" and args.path and not args.thread:
+            _print_json(inspect_rollout_file(args.path, last_n=args.last_n), pretty=args.pretty)
+            return 0
+
+        # Offline path for caption --path (no daemon required).
+        if args.cmd == "caption" and args.path and not args.ids and not args.registry:
+            rec = rollout_caption(args.path, max_chars=args.max_chars)
+            if args.json:
+                _print_json(rec, pretty=args.pretty)
+            else:
+                print(format_session_caption(rec, show_policy=args.show_policy), flush=True)
+            return 0
+
+        if args.cmd == "launch-batch" and args.dry_run:
+            spec_path = Path(args.spec).resolve()
+            raw_specs = json.loads(spec_path.read_text(encoding="utf-8"))
+            warnings: list[str] = []
+            validated = validate_fleet_spec(raw_specs, spec_path.parent, warnings)
+            summary = [
+                {
+                    "slot": item.get("slot", i + 1),
+                    "name": item["name"],
+                    "existing_thread_id": item.get("existing_thread_id"),
+                    "cwd": item["cwd"],
+                    "worktree": item.get("worktree"),
+                    "branch": item.get("branch"),
+                    "output_dir": item.get("output_dir"),
+                    "model": item.get("model"),
+                    "effort": item.get("effort"),
+                    "approval_policy": item["approval_policy"],
+                    "approvals_reviewer": item["approvals_reviewer"],
+                    "sandbox": item["sandbox"],
+                    "caption_guide": item["caption_guide"],
+                    "has_prompt": item["resolved_prompt"] is not None,
+                }
+                for i, item in enumerate(validated)
+            ]
+            _print_json(
+                {"dry_run": True, "count": len(summary), "warnings": warnings, "sessions": summary},
+                pretty=args.pretty,
+            )
+            return 0
+
         with CodexAppServerClient(sock_path=args.socket, timeout=args.timeout) as cli:
             if args.cmd == "health":
                 _print_json(cli.health(), pretty=args.pretty)
@@ -1613,11 +1744,14 @@ def main(argv: list[str] | None = None) -> int:
                 _print_json(res, pretty=args.pretty)
 
             elif args.cmd == "launch-batch":
-                if args.check_quota:
-                    cli.check_quota_or_raise()
                 spec_path = Path(args.spec).resolve()
                 raw_specs = json.loads(spec_path.read_text(encoding="utf-8"))
-                validated = validate_fleet_spec(raw_specs, spec_path.parent)
+                batch_warnings: list[str] = []
+                validated = validate_fleet_spec(raw_specs, spec_path.parent, batch_warnings)
+                if batch_warnings:
+                    print(json.dumps({"warnings": batch_warnings}, ensure_ascii=False), file=sys.stderr, flush=True)
+                if args.check_quota:
+                    cli.check_quota_or_raise()
                 results = []
                 for idx, item in enumerate(validated):
                     existing_tid = item.get("existing_thread_id")
@@ -1700,6 +1834,7 @@ def main(argv: list[str] | None = None) -> int:
                     "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "socket_path": cli.sock_path,
                     "session_count": len(results),
+                    "validation_warnings": batch_warnings,
                     "sessions": results,
                 }
                 registry_path.parent.mkdir(parents=True, exist_ok=True)

@@ -640,6 +640,141 @@ class TestCodexAppCtl(unittest.TestCase):
         lines = [json.loads(line) for line in proc_st.stdout.strip().splitlines()]
         self.assertEqual(len(lines), 2)
 
+    def _fleet_base(self) -> list[dict]:
+        t = self.tmp_path
+        return [
+            {"slot": 1, "name": "Ops", "cwd": str(t), "worktree": str(t / "wt-ops"), "branch": "exp/ops",
+             "output_dir": str(t / "out" / "ops"), "cluster_write_owner": True},
+            {"slot": 2, "name": "Track A", "cwd": str(t), "worktree": str(t / "wt-a"), "branch": "exp/a",
+             "output_dir": str(t / "out" / "a")},
+            {"slot": 3, "name": "Analyst", "cwd": str(t), "read_only": True, "output_dir": str(t / "out" / "analyst")},
+        ]
+
+    def _dry_run(self, spec: list[dict], tag: str) -> subprocess.CompletedProcess[str]:
+        path = self.tmp_path / f"spec-{tag}.json"
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        return self._run_cli("launch-batch", "--spec", str(path), "--dry-run")
+
+    def test_launch_batch_rejects_isolation_gaps_with_json_errors(self) -> None:
+        t = self.tmp_path
+        ok = self._dry_run(self._fleet_base(), "ok")
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        self.assertEqual(json.loads(ok.stdout)["warnings"], [])
+
+        def mutate(fn):
+            spec = self._fleet_base()
+            fn(spec)
+            return spec
+
+        def no_worktree(s, i):
+            s[i]["worktree"] = None
+            s[i]["branch"] = None
+
+        cases = {
+            "two_writers_shared_cwd": (mutate(lambda s: (no_worktree(s, 0), no_worktree(s, 1))), "Writer isolation collision"),
+            "same_worktree": (mutate(lambda s: s[1].update(worktree=s[0]["worktree"] + "/")), "Worktree isolation collision"),
+            "dup_branch": (mutate(lambda s: s[1].update(branch="exp/ops")), "Branch isolation collision"),
+            "two_owners": (mutate(lambda s: s[1].update(cluster_write_owner=True)), "cluster_write_owner"),
+            "nested_output": (mutate(lambda s: s[1].update(output_dir=str(t / "out" / "ops" / "a"))), "are nested"),
+            "same_output": (mutate(lambda s: s[2].update(output_dir=s[1]["output_dir"])), "Output directory isolation collision"),
+            "dup_slot": (mutate(lambda s: s[2].update(slot=2)), "Duplicate slot 2"),
+            "bad_json": (None, "JSONDecodeError"),
+        }
+        for tag, (spec, needle) in cases.items():
+            with self.subTest(tag):
+                if spec is None:
+                    path = self.tmp_path / "spec-bad_json.json"
+                    path.write_text("[{not json", encoding="utf-8")
+                    proc = self._run_cli("launch-batch", "--spec", str(path), "--dry-run")
+                else:
+                    proc = self._dry_run(spec, tag)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                err = json.loads(proc.stdout)
+                self.assertFalse(err["ok"])
+                self.assertIn(needle, err["error"] + " " + err["detail"])
+
+        # A missing spec file is a clean JSON error too.
+        missing = self._run_cli("launch-batch", "--spec", str(t / "nope.json"), "--dry-run")
+        self.assertEqual(missing.returncode, 1)
+        self.assertNotIn("Traceback", missing.stderr)
+        self.assertEqual(json.loads(missing.stdout)["error"], "FileNotFoundError")
+
+        # Soft findings pass but are reported.
+        soft = mutate(lambda s: (
+            s[1].update(worktree=str(t / "wt-ops" / ".worktrees" / "a")),
+            s[1].update(sandbox="danger-full-access"),
+        ))
+        proc_soft = self._dry_run(soft, "soft")
+        self.assertEqual(proc_soft.returncode, 0, proc_soft.stdout + proc_soft.stderr)
+        warnings = json.loads(proc_soft.stdout)["warnings"]
+        self.assertTrue(any("nested inside the write root of 'Ops'" in w for w in warnings), warnings)
+        self.assertTrue(any("danger-full-access" in w for w in warnings), warnings)
+
+        lone = mutate(lambda s: no_worktree(s, 1))
+        proc_lone = self._dry_run(lone, "lone")
+        self.assertEqual(proc_lone.returncode, 0, proc_lone.stdout + proc_lone.stderr)
+        self.assertTrue(
+            any("'Track A' has no dedicated worktree" in w for w in json.loads(proc_lone.stdout)["warnings"])
+        )
+
+    def test_offline_caption_reports_last_turn_state_not_any_completion(self) -> None:
+        def write_rollout(name: str, events: list[dict]) -> Path:
+            path = self.tmp_path / name
+            path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+            return path
+
+        def turn(tid: str, end: str | None, text: str | None = None) -> list[dict]:
+            evs = [
+                {"type": "event_msg", "payload": {"type": "task_started", "turn_id": tid}},
+                {"type": "turn_context", "payload": {"turn_id": tid, "model": "m", "effort": "low", "cwd": "/w"}},
+            ]
+            if text:
+                evs.append({"type": "response_item", "payload": {
+                    "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}})
+            if end == "complete":
+                evs.append({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": tid}})
+            elif end:
+                evs.append({"type": "event_msg", "payload": {"type": "turn_aborted", "turn_id": tid, "reason": end}})
+            return evs
+
+        def offline_caption(path: Path) -> tuple[dict, str]:
+            rec = json.loads(self._run_cli("caption", "--path", str(path), "--json").stdout)
+            plain = self._run_cli("caption", "--path", str(path)).stdout
+            return rec, plain
+
+        # Completed turn followed by an interrupted one: must not claim "completed".
+        p1 = write_rollout("r1.jsonl", turn("t1", "complete", "First turn done.") + turn("t2", "interrupted"))
+        rec, plain = offline_caption(p1)
+        self.assertEqual(rec["status_type"], "offline")
+        self.assertEqual(rec["last_turn_id"], "t2")
+        self.assertEqual(rec["last_turn_status"], "interrupted")
+        self.assertIn("last turn interrupted", plain)
+        self.assertIn("turn_aborted: interrupted", plain)
+        inspected = ctl.inspect_rollout_file(p1)
+        self.assertEqual(inspected["recent_errors"][-1]["turn_id"], "t2")
+
+        # Interrupted turn followed by a completed one: completed, and no stale abort note.
+        p2 = write_rollout("r2.jsonl", turn("t1", "interrupted") + turn("t2", "complete", "Recovered."))
+        rec2, plain2 = offline_caption(p2)
+        self.assertEqual(rec2["last_turn_status"], "completed")
+        self.assertIsNone(rec2["error"])
+        self.assertNotIn("Note:", plain2)
+
+        # Still running, and a non-interrupt abort reason.
+        p3 = write_rollout("r3.jsonl", turn("t1", "complete", "ok") + turn("t2", None))
+        self.assertEqual(offline_caption(p3)[0]["last_turn_status"], "inProgress")
+        p4 = write_rollout("r4.jsonl", turn("t1", "replaced"))
+        self.assertEqual(offline_caption(p4)[0]["last_turn_status"], "aborted")
+
+        # Old-format rollout with no turn ids anywhere: second context opens a new turn.
+        old = [
+            {"type": "turn_context", "payload": {"model": "m"}},
+            {"type": "event_msg", "payload": {"type": "task_complete"}},
+            {"type": "turn_context", "payload": {"model": "m"}},
+        ]
+        self.assertEqual(ctl.inspect_rollout_file(write_rollout("r5.jsonl", old))["last_turn_status"], "inProgress")
+
     def test_global_flags_before_after_and_mixed_with_subcommands(self) -> None:
         # 1. Trailing global flags after subcommand (matches SKILL.md / README.md examples)
         proc_after = subprocess.run(
