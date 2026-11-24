@@ -1554,6 +1554,135 @@ class TestCodexAppCtl(unittest.TestCase):
             self.assertEqual(skipped["reason"], "thread_not_loaded")
             self.assertTrue(self.server.threads[tid]["archived"])
 
+    def test_dispatch_inherits_sandbox_writable_roots_and_allows_overrides(self) -> None:
+        rollout_path = self.tmp_path / "rollout-inherit.jsonl"
+        out_dir = str((self.tmp_path / "output").resolve())
+        git_dir = str((self.tmp_path / "main-git").resolve())
+        rollout_entries = [
+            {
+                "timestamp": "2026-11-24T00:00:01Z",
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": "turn-init",
+                    "model": "gpt-6.2-astra",
+                    "effort": "ultra",
+                    "approval_policy": "on-request",
+                    "approvals_reviewer": "auto_review",
+                    "sandbox_policy": {
+                        "type": "workspace-write",
+                        "writable_roots": [out_dir, git_dir],
+                        "network_access": True,
+                        "exclude_slash_tmp": False,
+                        "exclude_tmpdir_env_var": False,
+                    },
+                    "cwd": str(self.tmp_path),
+                },
+            },
+            {
+                "timestamp": "2026-11-24T00:00:05Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete"},
+            },
+        ]
+        rollout_path.write_text("\n".join(json.dumps(e) for e in rollout_entries) + "\n", encoding="utf-8")
+
+        with ctl.CodexAppServerClient(str(self.sock_path)) as cli:
+            created = cli.start_thread(
+                name="Astra Inherit",
+                cwd=str(self.tmp_path),
+                prompt="Wave 1",
+                writable_roots=[out_dir, git_dir],
+                network_access=True,
+            )
+            tid = created["id"]
+            self.server.threads[tid]["path"] = str(rollout_path)
+            self._finish_turn(tid, "Wave 1 done.")
+
+            # 1. Bare CLI dispatch preserves writable_roots and network_access from rollout turn_context
+            proc1 = self._run_cli("dispatch", "--thread", tid, "--message", "Wave 2")
+            self.assertEqual(proc1.returncode, 0, proc1.stderr)
+            last_start = [p for m, p in self.server.calls if m == "turn/start"][-1]
+            self.assertEqual(
+                last_start["sandboxPolicy"],
+                {
+                    "type": "workspaceWrite",
+                    "writableRoots": [out_dir, git_dir],
+                    "networkAccess": True,
+                    "excludeSlashTmp": False,
+                    "excludeTmpdirEnvVar": False,
+                },
+            )
+
+            # 2. Explicit CLI overrides (--no-network-access, --writable-root "") take effect
+            self._finish_turn(tid, "Wave 2 done.")
+            proc2 = self._run_cli(
+                "dispatch",
+                "--thread",
+                tid,
+                "--message",
+                "Wave 3",
+                "--no-network-access",
+                "--writable-root",
+                "",
+            )
+            self.assertEqual(proc2.returncode, 0, proc2.stderr)
+            last_start2 = [p for m, p in self.server.calls if m == "turn/start"][-1]
+            self.assertEqual(last_start2["sandboxPolicy"]["writableRoots"], [])
+            self.assertFalse(last_start2["sandboxPolicy"]["networkAccess"])
+
+            # 3. Read-only thread stays read-only across unloaded resume + bare dispatch
+            ro_tid = cli.start_thread(name="ReadOnly Auditor", cwd=str(self.tmp_path), sandbox="read-only")["id"]
+            self.server.loaded.discard(ro_tid)
+            self.server.threads[ro_tid]["status"] = {"type": "notLoaded"}
+            proc3 = self._run_cli("dispatch", "--thread", ro_tid, "--message", "Audit output")
+            self.assertEqual(proc3.returncode, 0, proc3.stderr)
+            last_resume = [p for m, p in self.server.calls if m == "thread/resume"][-1]
+            last_start3 = [p for m, p in self.server.calls if m == "turn/start"][-1]
+            self.assertEqual(last_resume["sandbox"], "read-only")
+            self.assertEqual(last_start3["sandboxPolicy"]["type"], "readOnly")
+
+    def test_watch_wakes_on_watched_path_changes(self) -> None:
+        def make_client():
+            return ctl.CodexAppServerClient(str(self.sock_path))
+
+        out_dir = self.tmp_path / "exp-out"
+        out_dir.mkdir()
+        receipt = out_dir / "SELECTION-0150.json"
+
+        with make_client() as cli:
+            tid = cli.start_thread(name="Async Job Owner", cwd=str(self.tmp_path), prompt="Launch job")["id"]
+        self._finish_turn(tid, "Job 123 running; ending turn.")
+
+        clock = {"t": 0.0}
+        steps = [
+            lambda: None,
+            lambda: receipt.write_text('{"auroc": 0.84}\n', encoding="utf-8"),
+        ]
+
+        def fake_sleep(sec: float) -> None:
+            clock["t"] += sec
+            if steps:
+                steps.pop(0)()
+
+        res = ctl.watch_threads(
+            make_client,
+            [tid],
+            watch_paths=[str(out_dir)],
+            interval=10,
+            max_wait=60,
+            sleep=fake_sleep,
+            clock=lambda: clock["t"],
+        )
+        self.assertFalse(res["timedOut"])
+        self.assertEqual(len(res["events"]), 1)
+        self.assertEqual(res["events"][0]["type"], "path_changed")
+        self.assertEqual(res["events"][0]["change"], "created")
+        self.assertEqual(res["events"][0]["path"], str(receipt.resolve()))
+
+        # Path-only watch (no thread IDs) also works via CLI and times out with exit 4 when unchanged
+        proc_to = self._run_cli("watch", "--watch-path", str(out_dir / "*.json"), "--max-wait", "0")
+        self.assertEqual(proc_to.returncode, 4, proc_to.stdout + proc_to.stderr)
+
     def test_skill_markdown_frontmatter_and_relative_links(self) -> None:
         skill_md = REPO_ROOT / "SKILL.md"
         text = skill_md.read_text(encoding="utf-8")

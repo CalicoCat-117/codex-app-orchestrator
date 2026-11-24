@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import glob as _glob
 import json
 import os
 import re
@@ -535,6 +536,24 @@ class QuotaExhaustedError(RuntimeError):
         )
 
 
+_SANDBOX_MODE_ALIASES = {
+    "workspace-write": "workspace-write",
+    "workspacewrite": "workspace-write",
+    "read-only": "read-only",
+    "readonly": "read-only",
+    "danger-full-access": "danger-full-access",
+    "dangerfullaccess": "danger-full-access",
+}
+
+
+def _normalize_sandbox_mode(value: Any) -> str | None:
+    if isinstance(value, dict):
+        value = value.get("type")
+    if not isinstance(value, str):
+        return None
+    return _SANDBOX_MODE_ALIASES.get(value.strip().lower())
+
+
 def build_sandbox_policy(
     sandbox: str = "workspace-write",
     *,
@@ -547,7 +566,7 @@ def build_sandbox_policy(
     if sandbox == "workspace-write":
         return {
             "type": "workspaceWrite",
-            "writableRoots": list(writable_roots or []),
+            "writableRoots": [r for r in (writable_roots or []) if r],
             "networkAccess": bool(network_access),
             "excludeSlashTmp": bool(exclude_slash_tmp),
             "excludeTmpdirEnvVar": bool(exclude_tmpdir_env_var),
@@ -628,6 +647,72 @@ def resolve_socket_path(
 _ROLLOUT_LINE_HINT_RE = re.compile(
     rb'"(?:turn_context|assistant|task_started|task_complete|error|turn_aborted|warning)"'
 )
+
+
+def _latest_turn_context(rollout_path: str | Path | None, tail_bytes: int = 262144) -> dict[str, Any] | None:
+    """Fast read of the most recent `turn_context` payload from a rollout's tail (with full-scan fallback)."""
+    if not rollout_path:
+        return None
+    src = _rollout_source(rollout_path)
+    if src is None:
+        return None
+    try:
+        for line in reversed(_rollout_tail_lines(src, tail_bytes)):
+            if '"turn_context"' not in line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and obj.get("type") == "turn_context" and isinstance(obj.get("payload"), dict):
+                return obj["payload"]
+        if src.suffix == ".zst" or src.stat().st_size > tail_bytes:
+            found: dict[str, Any] | None = None
+            with _rollout_lines(src) as lines:
+                for raw in lines:
+                    if b'"turn_context"' not in raw:
+                        continue
+                    try:
+                        obj = json.loads(raw.decode("utf-8", errors="replace"))
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(obj, dict) and obj.get("type") == "turn_context" and isinstance(obj.get("payload"), dict):
+                        found = obj["payload"]
+            return found
+    except (OSError, RolloutReadError):
+        return None
+    return None
+
+
+def _resolve_inherited_policy(th: dict[str, Any]) -> dict[str, Any]:
+    """Derive a thread's effective policy and sandbox settings from its latest rollout `turn_context` or metadata."""
+    ctx = _latest_turn_context(th.get("path")) or {}
+    sb = ctx.get("sandbox_policy")
+    if not isinstance(sb, dict):
+        sb = th.get("sandboxPolicy") if isinstance(th.get("sandboxPolicy"), dict) else {}
+    sandbox_mode = (
+        _normalize_sandbox_mode(ctx.get("sandbox_policy"))
+        or _normalize_sandbox_mode(th.get("sandboxPolicy"))
+        or _normalize_sandbox_mode(th.get("sandbox"))
+        or "workspace-write"
+    )
+    roots = sb.get("writable_roots") if "writable_roots" in sb else sb.get("writableRoots")
+    net = sb.get("network_access") if "network_access" in sb else sb.get("networkAccess")
+    excl_tmp = sb.get("exclude_slash_tmp") if "exclude_slash_tmp" in sb else sb.get("excludeSlashTmp", False)
+    excl_env = (
+        sb.get("exclude_tmpdir_env_var") if "exclude_tmpdir_env_var" in sb else sb.get("excludeTmpdirEnvVar", False)
+    )
+    approval = ctx.get("approval_policy") or th.get("approvalPolicy") or "on-request"
+    reviewer = ctx.get("approvals_reviewer") or th.get("approvalsReviewer") or "auto_review"
+    return {
+        "approval_policy": approval if approval in VALID_APPROVAL_POLICIES else "on-request",
+        "approvals_reviewer": reviewer if reviewer in VALID_REVIEWERS else "auto_review",
+        "sandbox": sandbox_mode,
+        "writable_roots": [str(r) for r in roots] if isinstance(roots, list) else [],
+        "network_access": bool(net) if net is not None else False,
+        "exclude_slash_tmp": bool(excl_tmp),
+        "exclude_tmpdir_env_var": bool(excl_env),
+    }
 
 
 def inspect_rollout_file(
@@ -1445,18 +1530,22 @@ class CodexAppServerClient:
         *,
         model: str | None = None,
         effort: str | None = None,
-        approval_policy: str = "on-request",
-        approvals_reviewer: str = "auto_review",
-        sandbox: str = "workspace-write",
+        approval_policy: str | None = None,
+        approvals_reviewer: str | None = None,
+        sandbox: str | None = None,
         writable_roots: list[str] | None = None,
-        network_access: bool = False,
+        network_access: bool | None = None,
         cwd: str | None = None,
         steer_only: bool = False,
         queue_only: bool = False,
         check_quota: bool = False,
     ) -> dict[str, Any]:
         """Route a message by live state: steer an active turn, resume + start an unloaded thread,
-        start a turn on an idle one, and interrupt + restart a turn blocked on request_user_input."""
+        start a turn on an idle one, and interrupt + restart a turn blocked on request_user_input.
+
+        Any policy or sandbox field left as `None` inherits the thread's existing setting from its
+        latest rollout `turn_context` (falling back to Guardian `auto_review` defaults).
+        """
         if check_quota:
             self.check_quota_or_raise()
 
@@ -1483,6 +1572,7 @@ class CodexAppServerClient:
         status_type = (th.get("status") or {}).get("type") if isinstance(th.get("status"), dict) else th.get("status")
         resumed = False
         unarchived = False
+        inherited: dict[str, Any] | None = None
         if status_type == "notLoaded":
             if steer_only:
                 return {
@@ -1491,17 +1581,20 @@ class CodexAppServerClient:
                     "threadId": tid,
                     "status": th.get("status"),
                 }
+            inherited = _resolve_inherited_policy(th)
             pol = self.apply_policy(
                 tid,
                 model=model,
                 effort=effort,
-                approval_policy=approval_policy,
-                approvals_reviewer=approvals_reviewer,
-                sandbox=sandbox,
+                approval_policy=approval_policy or inherited["approval_policy"],
+                approvals_reviewer=approvals_reviewer or inherited["approvals_reviewer"],
+                sandbox=sandbox or inherited["sandbox"],
             )
             resumed = True
             unarchived = bool(pol.get("unarchived"))
             th = self.read_thread(tid, include_turns=False)
+            if unarchived:
+                inherited = None
 
         lt = self.latest_turn(tid)
         live_flags = (th.get("status") or {}).get("activeFlags") if isinstance(th.get("status"), dict) else None
@@ -1565,14 +1658,24 @@ class CodexAppServerClient:
                 "lastTurnStatus": lt.get("status") if lt else None,
             }
 
+        if inherited is None:
+            inherited = _resolve_inherited_policy(th)
+        eff_approval = approval_policy or inherited["approval_policy"]
+        eff_reviewer = approvals_reviewer or inherited["approvals_reviewer"]
+        eff_sandbox = sandbox or inherited["sandbox"]
+        eff_roots = writable_roots if writable_roots is not None else inherited["writable_roots"]
+        eff_net = network_access if network_access is not None else inherited["network_access"]
+
         turn_params: dict[str, Any] = {
             "threadId": tid,
-            "approvalPolicy": approval_policy,
-            "approvalsReviewer": approvals_reviewer,
+            "approvalPolicy": eff_approval,
+            "approvalsReviewer": eff_reviewer,
             "sandboxPolicy": build_sandbox_policy(
-                sandbox,
-                writable_roots=writable_roots,
-                network_access=network_access,
+                eff_sandbox,
+                writable_roots=eff_roots,
+                network_access=eff_net,
+                exclude_slash_tmp=inherited["exclude_slash_tmp"],
+                exclude_tmpdir_env_var=inherited["exclude_tmpdir_env_var"],
             ),
             "cwd": str(Path(cwd or th.get("cwd") or os.getcwd()).resolve()),
             "input": [{"type": "text", "text": message}],
@@ -1694,30 +1797,86 @@ def _watch_summary(st: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _snapshot_watch_paths(patterns: Iterable[str] | None) -> dict[str, tuple[int, int]]:
+    """Snapshot `(mtime_ns, size)` of files matched by paths, directories, or globs."""
+    snap: dict[str, tuple[int, int]] = {}
+    if not patterns:
+        return snap
+    for raw_pat in patterns:
+        if not raw_pat:
+            continue
+        expanded = os.path.expanduser(raw_pat)
+        matches = (
+            [Path(m) for m in _glob.glob(expanded, recursive=True)]
+            if _glob.has_magic(expanded)
+            else [Path(expanded)]
+        )
+        for cand in matches:
+            try:
+                st = cand.stat()
+            except OSError:
+                continue
+            if cand.is_dir():
+                for root, dirs, files in os.walk(cand):
+                    dirs[:] = [d for d in dirs if d not in (".git", "__pycache__")]
+                    for fname in files:
+                        fpath = Path(root) / fname
+                        try:
+                            fst = fpath.stat()
+                        except OSError:
+                            continue
+                        snap[str(fpath.resolve())] = (fst.st_mtime_ns, fst.st_size)
+            else:
+                snap[str(cand.resolve())] = (st.st_mtime_ns, st.st_size)
+    return snap
+
+
+def _diff_watch_snapshots(
+    before: dict[str, tuple[int, int]],
+    after: dict[str, tuple[int, int]],
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for path in sorted(set(before) | set(after)):
+        b = before.get(path)
+        a = after.get(path)
+        if b is None and a is not None:
+            events.append({"type": "path_changed", "change": "created", "path": path, "size": a[1]})
+        elif b is not None and a is None:
+            events.append({"type": "path_changed", "change": "deleted", "path": path})
+        elif b != a and a is not None:
+            events.append({"type": "path_changed", "change": "modified", "path": path, "size": a[1]})
+    return events
+
+
 def watch_threads(
     make_client: Any,
     ids: list[str],
     *,
+    watch_paths: list[str] | None = None,
     interval: float = 15.0,
     max_wait: float = 3600.0,
     ignore_current: bool = False,
     sleep: Any = time.sleep,
     clock: Any = time.monotonic,
 ) -> dict[str, Any]:
-    """Poll threads until one finishes a turn or needs attention, or `max_wait` passes.
+    """Poll threads (and optional local paths/globs) until an event occurs or `max_wait` passes.
 
     Each poll opens a fresh connection, so a long watch does not depend on one
     idle socket staying open. Events:
     - `attention`: the thread waits on a question, approval, or decision
       (see classify_attention). Existing attention counts unless `ignore_current`.
     - `turn_finished`: a turn that was running (or a new turn) reached a final state.
+    - `path_changed`: a watched file, directory tree, or glob gained, updated, or lost a file.
     """
     def poll() -> dict[str, dict[str, Any]]:
+        if not ids:
+            return {}
         with make_client() as cli:
             return {tid: cli.thread_status(tid) for tid in ids}
 
     start = clock()
     prev = poll()
+    prev_files = _snapshot_watch_paths(watch_paths)
     polls = 1
     events: list[dict[str, Any]] = []
     if not ignore_current:
@@ -1745,6 +1904,10 @@ def watch_threads(
                 before.get("last_turn_status") == "inProgress" or new_turn
             ):
                 events.append({"type": "turn_finished", **_watch_summary(st)})
+        if watch_paths:
+            cur_files = _snapshot_watch_paths(watch_paths)
+            events.extend(_diff_watch_snapshots(prev_files, cur_files))
+            prev_files = cur_files
         prev = cur
 
     return {
@@ -2064,10 +2227,16 @@ def build_parser() -> argparse.ArgumentParser:
     s_watch = sub.add_parser(
         "watch",
         parents=[sub_common],
-        help="Block until a watched thread finishes a turn or needs attention (exit 4 on timeout).",
+        help="Block until a watched thread finishes a turn, needs attention, or a watched path changes (exit 4 on timeout).",
     )
     s_watch.add_argument("ids", nargs="*", help="Thread UUID(s).")
     s_watch.add_argument("--registry", default=None, help="Load thread IDs from a FLEET-REGISTRY.json file.")
+    s_watch.add_argument(
+        "--watch-path",
+        action="append",
+        default=[],
+        help="Also wake when a file, directory tree, or glob changes (repeatable; e.g. output dir or receipt glob).",
+    )
     s_watch.add_argument("--interval", type=float, default=15.0, help="Seconds between polls (minimum 1, default 15).")
     s_watch.add_argument("--max-wait", type=float, default=3600.0, help="Give up after this many seconds (default 3600).")
     s_watch.add_argument(
@@ -2130,11 +2299,36 @@ def build_parser() -> argparse.ArgumentParser:
     s_disp.add_argument("--model", default=None, help="Model override for new turns.")
     s_disp.add_argument("--effort", default=None, help="Reasoning effort override for new turns.")
     s_disp.add_argument("--cwd", default=None, help="Working directory override for new turns.")
-    s_disp.add_argument("--approval-policy", default="on-request", choices=VALID_APPROVAL_POLICIES)
-    s_disp.add_argument("--approvals-reviewer", default="auto_review", choices=VALID_REVIEWERS)
-    s_disp.add_argument("--sandbox", default="workspace-write", choices=VALID_SANDBOXES)
-    s_disp.add_argument("--writable-root", action="append", default=[], help="Extra writable root (repeatable).")
-    s_disp.add_argument("--network-access", action="store_true", help="Allow network access inside sandbox.")
+    s_disp.add_argument(
+        "--approval-policy",
+        default=None,
+        choices=VALID_APPROVAL_POLICIES,
+        help="Approval policy override (default: inherit thread's policy, or on-request).",
+    )
+    s_disp.add_argument(
+        "--approvals-reviewer",
+        default=None,
+        choices=VALID_REVIEWERS,
+        help="Reviewer override (default: inherit thread's reviewer, or auto_review).",
+    )
+    s_disp.add_argument(
+        "--sandbox",
+        default=None,
+        choices=VALID_SANDBOXES,
+        help="Sandbox override (default: inherit thread's sandbox, or workspace-write).",
+    )
+    s_disp.add_argument(
+        "--writable-root",
+        action="append",
+        default=None,
+        help="Extra writable root override (repeatable; default: inherit thread's writable roots).",
+    )
+    s_disp.add_argument(
+        "--network-access",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override sandbox network access (default: inherit thread's setting).",
+    )
     s_disp.add_argument("--steer-only", action="store_true", help="Only steer an active turn; skip if idle/unloaded.")
     s_disp.add_argument("--queue-only", action="store_true", help="Queue via `codex queue --resume` instead of live RPC.")
     s_disp.add_argument("--check-quota", action="store_true", help="Abort if Codex quota is exhausted.")
@@ -2271,11 +2465,12 @@ def main(argv: list[str] | None = None) -> int:
             ids = list(args.ids)
             if args.registry:
                 ids.extend(_load_ids_from_registry(args.registry))
-            if not ids:
-                parser.error("watch requires at least one thread ID or --registry.")
+            if not ids and not args.watch_path:
+                parser.error("watch requires at least one thread ID, --registry, or --watch-path.")
             result = watch_threads(
                 lambda: CodexAppServerClient(sock_path=args.socket, timeout=args.timeout),
                 list(dict.fromkeys(ids)),
+                watch_paths=args.watch_path,
                 interval=max(1.0, args.interval),
                 max_wait=max(0.0, args.max_wait),
                 ignore_current=args.ignore_current,
