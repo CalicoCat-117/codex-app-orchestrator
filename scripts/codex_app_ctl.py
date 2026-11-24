@@ -2235,7 +2235,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--watch-path",
         action="append",
         default=[],
-        help="Also wake when a file, directory tree, or glob changes (repeatable; e.g. output dir or receipt glob).",
+        help="Also wake when a file, glob, or directory tree changes (repeatable). Prefer files that appear "
+        "when a job ends (a receipt or results file): a growing log in a watched folder wakes every poll.",
     )
     s_watch.add_argument("--interval", type=float, default=15.0, help="Seconds between polls (minimum 1, default 15).")
     s_watch.add_argument("--max-wait", type=float, default=3600.0, help="Give up after this many seconds (default 3600).")
@@ -2321,7 +2322,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--writable-root",
         action="append",
         default=None,
-        help="Extra writable root override (repeatable; default: inherit thread's writable roots).",
+        help="Writable root (repeatable). Replaces the thread's list; omit to keep it, pass '' to clear it.",
     )
     s_disp.add_argument(
         "--network-access",
@@ -2510,10 +2511,17 @@ def main(argv: list[str] | None = None) -> int:
                     _print_json(res, pretty=args.pretty)
 
             elif args.cmd == "create":
+                has_prompt = args.prompt is not None or args.prompt_file is not None
+                if not has_prompt and (args.writable_root or args.network_access):
+                    # thread/start takes no writable roots or network flag; they travel on turn/start.
+                    parser.error(
+                        "--writable-root and --network-access apply to the first turn: pass --prompt or "
+                        "--prompt-file, or pass them to the first dispatch instead."
+                    )
                 if args.check_quota:
                     cli.check_quota_or_raise()
                 prompt = None
-                if args.prompt is not None or args.prompt_file is not None:
+                if has_prompt:
                     prompt = _read_text_arg(args.prompt, args.prompt_file)
                 res = cli.start_thread(
                     name=args.name,

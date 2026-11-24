@@ -42,10 +42,17 @@ installation is required.
      - `inProgress` turn → **`turn/steer`** with `expectedTurnId` (immediate
        mid-turn injection; falls back to `turn/start` if the turn finishes mid-race)
      - `notLoaded` thread → **`thread/resume`** then **`turn/start`**
-     - `idle` thread → **`turn/start`** with explicit policy/sandbox/model overrides
+     - `idle` thread → **`turn/start`** with explicit policy and sandbox fields
      - turn blocked on `request_user_input` (`activeFlags: ["waitingOnUserInput"]`)
        → **`turn/interrupt`** then **`turn/start`** with the answer, because a steer
        cannot answer the pending tool call
+   - Those explicit fields default to the thread's own settings from its latest
+     turn (approval policy, reviewer, sandbox, writable roots, network access),
+     so a follow-up keeps the access the session started with. Pass
+     `--sandbox`, `--writable-root` (`''` clears the list), or
+     `--[no-]network-access` only to change them. `create` applies
+     `--writable-root` and `--network-access` on its first turn, so it needs a
+     prompt to use them.
    - Instruct every executor to follow the **Turn-Yielding Protocol** (launch
      async jobs or timers, record state, and end the turn immediately — never
      spin in a `sleep()` loop inside a turn).
@@ -275,7 +282,11 @@ When running continuous multi-round research or engineering:
 
    Add `--ignore-current` when you deliberately leave a thread waiting (for
    example, its question is with the user) so the same attention does not
-   return the watch again.
+   return the watch again. When an executor has yielded while an external job
+   runs, add `--watch-path` (repeatable) on the file the job writes when it
+   ends, such as `'/abs/out/*receipt*.json'`, so the watch also returns a
+   `path_changed` event the moment it appears. Avoid watching a whole folder
+   that holds a growing log: every write to it wakes the watch.
 5. If `health` / `--check-quota` returns exit code `3` (`quota_exhausted`),
    follow the failover / handoff-back protocol in
    [references/fleet-and-supervision-patterns.md](./references/fleet-and-supervision-patterns.md).

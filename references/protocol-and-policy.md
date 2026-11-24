@@ -110,6 +110,13 @@ thread unloads.
 **every `turn/start` call** (which the app-server schema explicitly defines as
 *"Override ... for this turn and subsequent turns"*).
 
+Because those fields override the thread, `dispatch` fills any you leave unset
+from the thread's latest rollout `turn_context` (sandbox mode, writable roots,
+network access, approval policy, reviewer). Before this, a bare `dispatch`
+sent `writableRoots: []` and silently dropped the roots a session was created
+with. `--writable-root` replaces the list (`''` clears it), and
+`--no-network-access` / `--network-access` set the network flag.
+
 ### Ground-Truth Verification via Rollout JSONL
 
 Never assume policy took effect solely from `thread/resume` output. Verify from

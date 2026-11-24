@@ -1641,6 +1641,29 @@ class TestCodexAppCtl(unittest.TestCase):
             self.assertEqual(last_resume["sandbox"], "read-only")
             self.assertEqual(last_start3["sandboxPolicy"]["type"], "readOnly")
 
+    def test_create_rejects_writable_root_without_a_first_turn(self) -> None:
+        # thread/start takes no writable roots, so without a prompt they would be dropped silently.
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS_DIR / "codex_app_ctl.py"),
+                "create",
+                "--name",
+                "No prompt",
+                "--writable-root",
+                "/tmp/out",
+                "--socket",
+                str(self.sock_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("apply to the first turn", proc.stderr)
+        self.assertNotIn("thread/start", [method for method, _ in self.server.calls])
+
     def test_watch_wakes_on_watched_path_changes(self) -> None:
         def make_client():
             return ctl.CodexAppServerClient(str(self.sock_path))

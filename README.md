@@ -68,7 +68,7 @@ Unattended agent workflows often fall into a false dichotomy: either leave manua
    - `sandbox: "workspace-write"` with `networkAccess: false` (or `sandbox: "read-only"` for analyst/auditor slots)
 2. **Eliminating the Already-Loaded Thread Policy Gotcha**:
    - Calling `thread/resume` alone on a thread already resident in daemon memory can leave cached in-memory policy settings active until the thread unloads.
-   - `codex_app_ctl.py dispatch` passes explicit `approvalPolicy`, `approvalsReviewer`, and `sandboxPolicy` fields on **every `turn/start` call**, guaranteeing the active policy takes effect immediately.
+   - `codex_app_ctl.py dispatch` passes explicit `approvalPolicy`, `approvalsReviewer`, and `sandboxPolicy` fields on **every `turn/start` call**, guaranteeing the active policy takes effect immediately. Unless you pass an override, it copies them from the thread's latest turn, so follow-ups keep the session's writable roots and network setting.
 3. **Ground-Truth Rollout Verification**:
    - Instead of trusting scheduler metadata alone, `status --verify-policy` and `inspect-rollout` parse the thread's actual rollout JSONL `turn_context` records to verify effective `approval_policy`, `approvals_reviewer`, `sandbox_policy`, `model`, and `effort`.
 
@@ -256,14 +256,15 @@ python3 scripts/codex_app_ctl.py launch-batch \
 | `caption` | Render a readable, unembellished, principle-first caption from a live thread, registry, or offline rollout. | `--registry`, `--path`, `--max-chars`, `--show-policy`, `--json` |
 | `create` | Create a persistent UI-visible thread (`thread/start` + `thread/name/set` + optional Turn-1 `turn/start`). | `--name`, `--cwd`, `--prompt`, `--prompt-file`, `--approval-policy`, `--approvals-reviewer`, `--sandbox`, `--no-caption-guide`, `--check-quota` |
 | `launch-batch` | Validate isolation constraints, launch/reuse a fleet from JSON spec, and emit `FLEET-REGISTRY.json`. | `--spec`, `--registry-out`, `--dry-run`, `--check-quota` |
-| `dispatch` | Smart non-blocking send: `turn/steer` if `inProgress`, `thread/resume` + `turn/start` if `notLoaded` (unarchiving first if archived), `turn/start` if `idle`. | `--thread`, `--message`, `--message-file`, `--steer-only`, `--queue-only`, `--check-quota` |
+| `dispatch` | Smart non-blocking send: `turn/steer` if `inProgress`, `thread/resume` + `turn/start` if `notLoaded` (unarchiving first if archived), `turn/start` if `idle`. New turns keep the thread's sandbox, writable roots, network access, and approval settings unless overridden. | `--thread`, `--message`, `--message-file`, `--steer-only`, `--queue-only`, `--writable-root`, `--[no-]network-access`, `--check-quota` |
+| `watch` | Block until a watched thread finishes a turn or needs attention, or a watched file or glob changes (`path_changed`); exit `4` on timeout. | `<THREAD_UUID>...`, `--registry`, `--watch-path`, `--interval`, `--max-wait`, `--ignore-current` |
 | `set-policy` | Apply `approvalPolicy`, `approvalsReviewer`, `sandbox`, and optional `model`/`effort` via `thread/resume`. | `--approval-policy`, `--approvals-reviewer`, `--sandbox`, `--model`, `--effort` |
 | `interrupt` | Gracefully stop an active turn via `turn/interrupt` (auto-detects active turn ID). | `--thread`, `--turn` |
 | `inspect-rollout` | Read-only inspection of rollout JSONL (plain or `zstd`-compressed `.jsonl.zst`) for ground-truth `turn_context`, recent messages, and errors. | `--thread` or `--path` (100% offline), `--last-n` |
 | `retire` | Archive sessions with no follow-up; skips running turns, pending questions or decisions, and failed/interrupted last turns, with a reason per skip. A thread another Codex process holds open is skipped as `held_by_other_process`; any other per-thread failure is reported as `action: "error"` and the batch continues (exit `1`). | `<THREAD_UUID>...`, `--registry`, `--dry-run`, `--force` |
 | `archive` / `unarchive` / `delete` | Unchecked thread lifecycle cleanup (`delete` for throwaway smoke tests). | `<THREAD_UUID>...` |
 
-**Exit Codes:** `0` = success · `1` = RPC, socket, or validation error (for `retire`: at least one thread errored) · `3` = quota exhausted (`ordinaryUsageAllowed == false`).
+**Exit Codes:** `0` = success · `1` = RPC, socket, or validation error (for `retire`: at least one thread errored) · `3` = quota exhausted (`ordinaryUsageAllowed == false`) · `4` = `watch` timed out with nothing new.
 
 ---
 
