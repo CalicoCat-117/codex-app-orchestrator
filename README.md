@@ -96,10 +96,11 @@ Running 2–5 parallel Codex writers inside a single working tree almost guarant
 For multi-round engineering and research runs spanning hours, `codex-app-orchestrator` formalizes a calm, low-noise supervision rhythm that respects both human attention and shared compute resources:
 
 1. **Preflight Health & Quota Check**: Query daemon status, defaults from `~/.codex/config.toml`, and live rate limits via `account/rateLimits/read`.
-2. **Local-First Artifact Audit**: Run `status --registry FLEET-REGISTRY.json --verify-policy --last-message`, inspect Git commit SHAs in each worktree, and read emitted JSON receipts. Completion is claimed **only from verified artifacts**, never from a thread going `idle` or a scheduler returning success.
+2. **Local-First Artifact Audit**: Run `status --registry FLEET-REGISTRY.json --last-message` (add `--verify-policy` once after launch or a policy change), inspect Git commit SHAs in each worktree, and read emitted JSON receipts. Completion is claimed **only from verified artifacts**, never from a thread going `idle` or a scheduler returning success.
 3. **Synthesize & Integrate**: Review deliverables across tracks and instruct Slot 1 to integrate verified commits cleanly.
 4. **Smart Dispatch**: Issue compact, self-contained round directives (using [`examples/directive.example.md`](./examples/directive.example.md)) via `dispatch --check-quota`. Slots that get no further work are archived with `retire`.
 5. **Milestone-Aligned Wakeups & Telemetry Hygiene**: Schedule check-ins at real milestones (typically 20–45 minutes) and space any live external telemetry checks by at least 10 seconds (preferring 15–60s+ or passive single-collector logs).
+6. **Readable Reports**: The supervisor tells the user what changed and why, with results against a baseline. Checks that passed (quota, policy, timers, fingerprints, preflight items) stay out of the report; a check is mentioned only when it fails or needs the user, and a wake-up with nothing new produces no message.
 
 ![Continuous Supervision Loop and Quota-Aware Failover](./assets/04-supervision-failover.jpg)
 

@@ -100,7 +100,9 @@ When running continuous autonomous cycles:
    an expected checkpoint/CI completion) using the supervisor's scheduler tool.
 2. **Local-first audit**:
    - Run `codex_app_ctl.py health` (check quota) and
-     `codex_app_ctl.py status --registry FLEET-REGISTRY.json --verify-policy --last-message`.
+     `codex_app_ctl.py status --registry FLEET-REGISTRY.json --last-message`.
+     Run `--verify-policy` once after launch or a policy change, not at every
+     check-in.
    - Inspect local git logs (`git -C <wt> log -n 3 --oneline`), emitted JSON
      receipts, manifests, and markdown summaries.
    - Claim completion **only** from emitted verified artifacts/receipts — never
@@ -170,7 +172,9 @@ raw JSON blobs, emoji-heavy hype cards, or repetitive gatekeeping checklists.
   `"caption_guide": false` opts out), asking workers to conclude substantive
   turns with 3–5 plain sentences or tight bullets explaining the underlying
   mechanism/rationale and concrete observed results.
-- **Supervisor reporting:** Use `codex_app_ctl.py caption --registry FLEET-REGISTRY.json`
-  (or `caption <THREAD_UUID>` / offline `caption --path <rollout.jsonl>`) to
-  extract and present readable captions without noisy policy dumps. Policy
-  details stay hidden unless an actual error occurs or `--show-policy` is passed.
+- **Supervisor reporting:** Follow "Reporting to the User" in `SKILL.md`:
+  report findings and their causes, and mention a check only when it fails or
+  needs the user. `codex_app_ctl.py caption --registry FLEET-REGISTRY.json`
+  (or `caption <THREAD_UUID>` / offline `caption --path <rollout.jsonl>`)
+  gives readable per-session captions to draw on; policy details stay hidden
+  unless an actual error occurs or `--show-policy` is passed.

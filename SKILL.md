@@ -7,7 +7,8 @@ description: >-
   or iterative research execution to Codex threads while preserving live Codex
   Desktop/VSCode visibility, Guardian `auto_review` policy, non-blocking mid-turn
   steering (`turn/steer`), multi-session worktree isolation, periodic check-ins,
-  and quota-aware failover.
+  quota-aware failover, and readable reports to the user (mechanism and results
+  first, internal checks mentioned only when they fail).
 ---
 
 # Codex App Orchestrator
@@ -33,9 +34,11 @@ installation is required.
      `networkAccess: false`).
    - Do not switch to `never` / `danger-full-access` unless the user explicitly
      authorizes it.
-   - Verify effective policy on real turns via rollout `turn_context`
-     (`status --verify-policy` or `inspect-rollout`), because already-loaded
-     threads only reflect updated policy overrides on their next `turn/start`.
+   - Verify the effective policy once, after `create`, `launch-batch`, or a
+     policy change, via rollout `turn_context` (`status --verify-policy` or
+     `inspect-rollout`), because already-loaded threads only reflect updated
+     policy overrides on their next `turn/start`. Later `dispatch` calls keep
+     the thread's settings (rule 3), so routine check-ins need not repeat it.
 3. **Never let directives stall behind an active turn.**
    - Use `dispatch` for every message: it inspects live turn state and
      automatically routes:
@@ -100,15 +103,16 @@ installation is required.
      scope or budget, and headline conclusions to the user.
    - Do not run unattended executors in Codex Plan mode: `request_user_input`
      is available there and blocks the turn.
-7. **Return plain, principle-first session captions.**
-   - Keep session updates and handoffs easy to read and understated: explain the
-     underlying mechanism, root cause, or design rationale (*why* a change works
-     or failed) alongside concrete observed outcomes (files, commits, metrics,
-     or open unknowns).
-   - Avoid decorative emojis, hype phrasing, and repetitive gatekeeping or
-     compliance checklists—only surface policy, sandbox, or error notes when a
-     real deviation or blocker occurs (or when explicitly requested).
-   - `create` and `launch-batch` attach this lightweight caption guide to
+7. **Keep reports readable, yours and the executors'.**
+   - Your own messages to the user follow
+     [Reporting to the User](#reporting-to-the-user): mechanism and results at
+     the center, and checks left out unless one fails.
+   - Executors get the same principle through a lightweight caption guide:
+     plain, principle-first captions that explain the underlying mechanism,
+     root cause, or design rationale (*why* a change works or failed) alongside
+     concrete observed outcomes (files, commits, metrics, or open unknowns),
+     without decorative emojis, hype, or compliance checklists.
+   - `create` and `launch-batch` attach this caption guide to
      `developerInstructions` by default (disable with `--no-caption-guide` or
      `"caption_guide": false`), and `caption` extracts and formats clean plain
      captions from live sessions or rollouts.
@@ -195,7 +199,7 @@ with exit code 1. Nested writer worktrees, writers without a worktree, and
 (the dry-run output and the registry's `validation_warnings`); read them before
 launching.
 
-### 3. Monitor, Render Captions, Verify Policy, and Steer/Dispatch
+### 3. Monitor, Read Captions, and Steer/Dispatch
 
 Inspect the whole fleet in one lightweight O(1) pass (uses `thread/turns/list`
 with `limit=1`, avoiding full-history downloads), or render a readable,
@@ -204,7 +208,10 @@ unembellished caption directly:
 ```bash
 python3 scripts/codex_app_ctl.py status \
   --registry /abs/path/to/FLEET-REGISTRY.json \
-  --verify-policy --last-message --pretty
+  --last-message --pretty
+
+# Once after create, launch-batch, or a policy change: confirm the effective policy
+python3 scripts/codex_app_ctl.py status <THREAD_UUID> --verify-policy --pretty
 
 # Plain, principle-first session caption (supports thread IDs, --registry, or offline --path)
 python3 scripts/codex_app_ctl.py caption --registry /abs/path/to/FLEET-REGISTRY.json
@@ -261,10 +268,11 @@ When running continuous multi-round research or engineering:
 
 1. Align each supervision check-in to a real milestone (e.g., expected job
    checkpoint or 20–45 min cadence) using the host agent's scheduler/timer.
-2. Perform a **local-first audit**: run `status --registry ... --verify-policy`,
+2. Perform a **local-first audit**: run `status --registry ... --last-message`,
    check git commits/diffs in each worktree, and read emitted result artifacts
    or manifests. Claim completion only from verified artifacts, never from turn
-   or scheduler status alone.
+   or scheduler status alone. Report what the audit found, not the list of
+   what you checked (see [Reporting to the User](#reporting-to-the-user)).
 3. Synthesize findings, decide the next round's directions, write concise
    directive files, and call `dispatch` for each slot that needs new work or
    mid-turn steering. Answer every thread with `attention` set (see rule 6),
@@ -286,14 +294,48 @@ When running continuous multi-round research or engineering:
    runs, add `--watch-path` (repeatable) on the file the job writes when it
    ends, such as `'/abs/out/*receipt*.json'`, so the watch also returns a
    `path_changed` event the moment it appears. Avoid watching a whole folder
-   that holds a growing log: every write to it wakes the watch.
+   that holds a growing log: every write to it wakes the watch. When a
+   wake-up brings nothing new, send the user no message; keep watching.
 5. If `health` / `--check-quota` returns exit code `3` (`quota_exhausted`),
    follow the failover / handoff-back protocol in
    [references/fleet-and-supervision-patterns.md](./references/fleet-and-supervision-patterns.md).
 
-## Validation Checklist
+## Reporting to the User
 
-After creating or updating sessions, verify:
+Your messages are what the user reads of this work. There is no fixed format:
+shape each one to fit what happened, in the user's language.
+
+- **Mechanism and results at the center.** Explain why something works or
+  fails, not only that it did, and give numbers against a fair baseline with
+  the setup needed to read them. Keep negative results. Use a figure, with a
+  caption, when it shows a result faster than words: an executor's plot, or
+  one you draw from its output files.
+- **Academic and plain.** Exact terms; no emojis, hype, or decorative
+  formatting.
+- **Checks stay silent unless one fails.** You run many checks; the user needs
+  one only when it fails, changes the plan, or needs their decision. Leave out
+  daemon, quota, policy, sandbox, and network status; `--verify-policy`
+  results; "no session needs attention"; retire and archive results;
+  registry, timer, and relay state; and passed preflight items, fingerprints,
+  hashes, byte-for-byte or protocol-section checks, and release records.
+- **Verification as evidence in the sentence.** When a claim rests on a
+  check, say so where you make the claim ("recomputed from
+  `out/metrics.json`: 0.812, as reported") instead of a separate list of what
+  you checked.
+- **Plain words for internal terms.** Call sessions by name, not thread UUID.
+  Say what a protocol section or rule requires instead of citing its number.
+  Describe routing in everyday words ("sent the correction while it was still
+  working", not "`turn/steer`").
+- **Speak when something changed:** a result, a failure, a decision for the
+  user, or a new time estimate. A wake-up with nothing new needs no message.
+
+When a decision needs the user, ask it briefly: the question, the options, and
+your recommendation with one reason.
+
+## Checks (Report Only a Failure)
+
+Run these after creating or updating sessions. Tell the user only about a check
+that fails or needs their decision.
 
 - `health` reports `daemon.status == "running"` and `quota.ordinaryUsageAllowed == true`.
 - `status --attention-only` prints nothing, or every listed thread has been
@@ -302,7 +344,8 @@ After creating or updating sessions, verify:
   `archived: true`), so the sidebar holds only working or waiting sessions.
 - `health.models.configuredIsNewest` is not `false`. If it is, a newer model of the
   configured family exists; raise it with the user before launching more work.
-- `status --verify-policy` shows `rollout_turn_context.approval_policy == "on-request"`,
+- After `create`, `launch-batch`, or a policy change, `status --verify-policy` shows
+  `rollout_turn_context.approval_policy == "on-request"`,
   `approvals_reviewer == "auto_review"`, and expected `model` / `effort` / `sandbox_policy`.
 - Every writer slot in `FLEET-REGISTRY.json` points to a distinct worktree/branch
   and output directory, and commits cleanly without touching peer worktrees.
